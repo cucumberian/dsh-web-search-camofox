@@ -1,0 +1,5 @@
+packages:
+  - .
+  - ../ai/dsh/packages/*/*
+  - ../ai/dsh/vendor/*
+  - ../ai/dsh/apps/*

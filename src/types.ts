@@ -38,6 +38,7 @@ export type CamofoxEngine =
   | 'youtube'
   | 'amazon'
   | 'reddit'
+  | 'reddit_subreddit'
   | 'wikipedia'
   | 'twitter'
   | 'yelp'

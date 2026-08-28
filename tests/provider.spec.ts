@@ -3,20 +3,21 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { CamoFoxSearchProvider, mapCamoFoxResults, CAMOFOX_PROVIDER_ID } from '../src/provider.ts'
-import type { CamoFoxSearchProviderOptions, WebSearchRequest } from '../src/provider.ts'
+import { CamofoxSearchProvider, CAMOFOX_PROVIDER_ID, parseSources } from '../src/provider.ts'
+import type { CamofoxSearchProviderOptions } from '../src/provider.ts'
 
-describe('CamoFoxSearchProvider', () => {
-  let mockOptions: () => CamoFoxSearchProviderOptions
-  let provider: CamoFoxSearchProvider
+describe('CamofoxSearchProvider', () => {
+  let mockOptions: CamofoxSearchProviderOptions
+  let provider: CamofoxSearchProvider
 
   beforeEach(() => {
-    mockOptions = () => ({
-      baseURL: 'http://localhost:4444',
+    mockOptions = {
+      baseURL: 'http://localhost:9377',
+      userId: 'default-user',
+      sessionKey: 'dsh-web-search',
       engine: 'google',
-      maxResults: 10,
-    })
-    provider = new CamoFoxSearchProvider(mockOptions)
+    }
+    provider = new CamofoxSearchProvider(mockOptions)
   })
 
   it('registers with correct provider id', () => {
@@ -28,66 +29,54 @@ describe('CamoFoxSearchProvider', () => {
   })
 
   it('reports unavailable when baseURL is invalid', () => {
-    mockOptions = () => ({
-      baseURL: 'not-a-url',
-      engine: 'google',
-      maxResults: 10,
-    })
-    provider = new CamoFoxSearchProvider(mockOptions)
-    expect(provider.available()).toBe(false)
-  })
-
-  it('reports unavailable when maxResults is not positive integer', () => {
-    mockOptions = () => ({
-      baseURL: 'http://localhost:4444',
-      engine: 'google',
-      maxResults: 0,
-    })
-    provider = new CamoFoxSearchProvider(mockOptions)
-    expect(provider.available()).toBe(false)
+    const provider2 = new CamofoxSearchProvider({ ...mockOptions, baseURL: 'not-a-url' })
+    expect(provider2.available()).toBe(false)
   })
 })
 
-describe('mapCamoFoxResults', () => {
-  it('returns empty result for null snapshot', () => {
-    const result = mapCamoFoxResults(null, 10)
-    expect(result.sources).toEqual([])
-    expect(result.truncated).toBe(false)
+describe('parseSources', () => {
+  it('extracts sources from accessibility snapshot', () => {
+    const snapshot = `
+- link "Test Result" [e1]:
+    - /url: https://example.com/result
+- text "This is a test snippet" [e2]
+`
+    const sources = parseSources(snapshot)
+    expect(sources).toHaveLength(1)
+    expect(sources[0].url).toBe('https://example.com/result')
+    expect(sources[0].title).toBe('Test Result')
+    expect(sources[0].snippet).toBe('This is a test snippet')
   })
 
-  it('returns empty result for invalid snapshot', () => {
-    const result = mapCamoFoxResults('not-an-object', 10)
-    expect(result.sources).toEqual([])
-    expect(result.truncated).toBe(false)
+  it('deduplicates repeated URLs', () => {
+    const snapshot = `
+- link "Result 1" [e1]:
+    - /url: https://example.com/1
+- text "Snippet 1" [e2]
+- link "Result 2" [e3]:
+    - /url: https://example.com/1
+- text "Snippet 2" [e4]
+`
+    const sources = parseSources(snapshot)
+    expect(sources).toHaveLength(1)
   })
 
-  it('extracts sources from results array', () => {
-    const snapshot = {
-      results: [
-        { url: 'https://example.com/1', title: 'Result 1', snippet: 'Snippet 1' },
-        { url: 'https://example.com/2', title: 'Result 2' },
-      ],
-    }
-    const result = mapCamoFoxResults(snapshot, 10)
-    expect(result.sources).toHaveLength(2)
-    expect(result.sources[0].url).toBe('https://example.com/1')
-    expect(result.sources[0].title).toBe('Result 1')
-    expect(result.sources[0].snippet).toBe('Snippet 1')
-    expect(result.sources[1].url).toBe('https://example.com/2')
-    expect(result.sources[1].title).toBe('Result 2')
-    expect(result.truncated).toBe(false)
+  it('filters out Google chrome URLs', () => {
+    const snapshot = `
+- link "Google Login" [e1]:
+    - /url: https://accounts.google.com/ServiceLogin
+- text "Login" [e2]
+- link "Real Result" [e3]:
+    - /url: https://example.com/real
+- text "Real snippet" [e4]
+`
+    const sources = parseSources(snapshot)
+    expect(sources).toHaveLength(1)
+    expect(sources[0].url).toBe('https://example.com/real')
   })
 
-  it('truncates when maxResults exceeded', () => {
-    const snapshot = {
-      results: [
-        { url: 'https://example.com/1' },
-        { url: 'https://example.com/2' },
-        { url: 'https://example.com/3' },
-      ],
-    }
-    const result = mapCamoFoxResults(snapshot, 2)
-    expect(result.sources).toHaveLength(2)
-    expect(result.truncated).toBe(true)
+  it('returns empty array for empty snapshot', () => {
+    const sources = parseSources('')
+    expect(sources).toEqual([])
   })
 })

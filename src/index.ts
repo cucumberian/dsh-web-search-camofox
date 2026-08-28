@@ -14,20 +14,24 @@ import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-web'
 import {
-  CamoFoxSearchProvider,
-  CAMOFOX_DEFAULT_BASE_URL,
-  CAMOFOX_DEFAULT_ENGINE,
+  CamofoxSearchProvider,
   CAMOFOX_PROVIDER_ID,
+  CAMOFOX_DEFAULT_BASE_URL,
+  CAMOFOX_DEFAULT_USER_ID,
+  CAMOFOX_DEFAULT_SESSION_KEY,
+  CAMOFOX_DEFAULT_ENGINE,
 } from './provider.ts'
-import type { CamoFoxSearchProviderOptions, CamoFoxEngine } from './provider.ts'
+import type { CamofoxSearchProviderOptions, CamofoxEngine } from './provider.ts'
 
 export {
-  CamoFoxSearchProvider,
-  CAMOFOX_DEFAULT_BASE_URL,
-  CAMOFOX_DEFAULT_ENGINE,
+  CamofoxSearchProvider,
   CAMOFOX_PROVIDER_ID,
+  CAMOFOX_DEFAULT_BASE_URL,
+  CAMOFOX_DEFAULT_USER_ID,
+  CAMOFOX_DEFAULT_SESSION_KEY,
+  CAMOFOX_DEFAULT_ENGINE,
 } from './provider.ts'
-export type { CamoFoxSearchProviderOptions, CamoFoxEngine } from './provider.ts'
+export type { CamofoxSearchProviderOptions, CamofoxEngine } from './provider.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'web-search-camofox'
@@ -43,24 +47,27 @@ export interface Config {
   apiKey?: string
   /** Credential reference resolved for each search; defaults to `CAMOFOX_API_KEY`. */
   apiKeyEnv?: string
-  /** CamoFox server base URL. Defaults to `http://localhost:4444`. */
+  /** CamoFox server base URL. Defaults to `http://localhost:9377`. */
   baseURL?: string
+  /** CamoFox user ID. Defaults to `default-user`. */
+  userId?: string
+  /** CamoFox session key. Defaults to `dsh-web-search`. */
+  sessionKey?: string
   /** Search engine to use. Defaults to `google`. */
-  engine?: CamoFoxEngine
-  /** Maximum results to extract per search. Defaults to 10. */
-  maxResults?: number
+  engine?: CamofoxEngine
 }
 
 export const Config: z<Config> = z.object({
   apiKey: z.string().role('secret'),
   apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV),
   baseURL: z.string().default(CAMOFOX_DEFAULT_BASE_URL),
-  engine: z.enum([
+  userId: z.string().default(CAMOFOX_DEFAULT_USER_ID),
+  sessionKey: z.string().default(CAMOFOX_DEFAULT_SESSION_KEY),
+  engine: z.union([
     'google', 'youtube', 'amazon', 'reddit', 'reddit_subreddit',
     'wikipedia', 'twitter', 'yelp', 'spotify', 'netflix',
     'linkedin', 'instagram', 'tiktok', 'twitch'
   ] as const).default(CAMOFOX_DEFAULT_ENGINE),
-  maxResults: z.number().step(1).min(1).max(50).default(10),
 })
 
 /** Settings namespace carrying this provider's endpoint, engine, and key reference. */
@@ -74,7 +81,7 @@ export const WEB_SEARCH_CAMOFOX_SETTINGS_NAMESPACE = settingsNamespace('web-sear
  * @param config - the currently authoritative section.
  * @returns options for one search.
  */
-function resolveOptions(ctx: Context, config: Config): CamoFoxSearchProviderOptions {
+function resolveOptions(ctx: Context, config: Config): CamofoxSearchProviderOptions {
   const apiKeyEnv = credentialRef(config.apiKeyEnv ?? DEFAULT_API_KEY_ENV)
   const literalApiKey = config.apiKey !== undefined && config.apiKey.length > 0
     ? config.apiKey
@@ -91,14 +98,9 @@ function resolveOptions(ctx: Context, config: Config): CamoFoxSearchProviderOpti
     },
     apiKeyEnv,
     baseURL: config.baseURL ?? CAMOFOX_DEFAULT_BASE_URL,
+    userId: config.userId ?? CAMOFOX_DEFAULT_USER_ID,
+    sessionKey: config.sessionKey ?? CAMOFOX_DEFAULT_SESSION_KEY,
     engine: config.engine ?? CAMOFOX_DEFAULT_ENGINE,
-    maxResults: config.maxResults ?? 10,
-    recordRequest: (request) => {
-      ctx.get('agents')?.currentInitiator()?.session.append(
-        'web/camofox-search-request',
-        request,
-      )
-    },
   }
 }
 
@@ -113,5 +115,5 @@ export function apply(ctx: Context, config: Config): void {
     // section per search, so a committed change needs no re-registration.
     onChange: () => {},
   })
-  ctx.web.registerSearchProvider(new CamoFoxSearchProvider(() => resolveOptions(ctx, current())))
+  ctx.web.registerSearchProvider(new CamofoxSearchProvider(resolveOptions(ctx, current())))
 }

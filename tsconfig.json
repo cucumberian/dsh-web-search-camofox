@@ -1,5 +1,5 @@
 {
-  "extends": "../../../tsconfig.base.json",
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "rootDir": "src",
     "outDir": "lib/types",
@@ -7,7 +7,7 @@
     "tsBuildInfoFile": "lib/tsconfig.tsbuildinfo",
     "baseUrl": ".",
     "paths": {
-      "@deepseek-ai/*": ["../../../packages/*/*/src"]
+      "@deepseek-ai/*": ["../../dsh/packages/*/*/src", "../../dsh/vendor/*/src"]
     }
   },
   "include": ["src/**/*.ts"],
