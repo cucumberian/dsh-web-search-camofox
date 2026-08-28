@@ -1,0 +1,7 @@
+title: "CamoFox Web Search Provider"
+description: "CamoFox-backed search provider for the DeepSeek Harness web capability seam"
+labels:
+  - web
+  - search
+  - camofox
+  - provider

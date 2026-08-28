@@ -1,0 +1,15 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types",
+    "composite": true,
+    "tsBuildInfoFile": "lib/tsconfig.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": {
+      "@deepseek-ai/*": ["../../../packages/*/*/src"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["tests", "lib"]
+}
