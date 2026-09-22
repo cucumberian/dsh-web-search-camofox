@@ -23,6 +23,7 @@ Every field is optional. Values come from, in precedence order, the Settings ser
         baseURL: "http://localhost:9377"   # camofox-browser REST API port
         engine: searx                      # search route (see Engines)
         maxSnapshotChars: 60000            # accessibility characters to parse
+        concurrency: 1                     # searches one instance runs at once
         apiKeyEnv: "CAMOFOX_API_KEY"       # credential reference for the key
 - id: web
   name: '@deepseek-ai/dsh-web'
@@ -40,6 +41,12 @@ Every field is optional. Values come from, in precedence order, the Settings ser
 | `engine` | `searx` | Search route, from the Engines table. |
 | `searchUrl` | unset | Results-page URL template containing `{query}`. Overrides the engine's own route; carries any SearxNG instance. |
 | `maxSnapshotChars` | `60000` | Snapshot characters the parser reads. Results past the bound are dropped. |
+| `concurrency` | `1` | Searches one provider instance runs at once against one camofox user. `1` queues them. |
+| `retries` | `2` | Fresh-tab attempts after a transient failure (`404`, `500`, `502`, `503`, `504`). `0` disables retrying. |
+| `retryDelayMs` | `750` | Wait before a retry opens its fresh tab. |
+| `concurrency` | `1` | Searches one provider instance runs at once against one camofox user. `1` queues them. |
+| `retries` | `2` | Fresh-tab attempts after a transient failure (`404`, `500`, `502`, `503`, `504`). `0` disables retrying. |
+| `retryDelayMs` | `750` | Wait before a retry opens its fresh tab. |
 
 `dsh-tool-web`'s own `maxResults` caps the source list the model sees; this provider does not truncate.
 
@@ -87,9 +94,11 @@ The provider:
 
 1. Resolves the key and the current settings section per search.
 2. Opens a tab, navigates it to the resolved route, reads its snapshot, closes it. A failed close leaves the tab in the user's pool and does not replace the search's outcome.
-3. Parses the accessibility tree into `WebSearchSource` entries, dropping archive mirrors (`web.archive.org`), pagination and utility links (`cached`, `translate`, `next`, `previous`), and duplicate URLs.
-4. Reports `truncated: false`; `dsh-tool-web` sets the flag when it caps the list.
-5. Fails with `WEB_ABORTED` on an aborted request and `WEB_PROVIDER_ERROR` otherwise.
+3. Queues searches per instance (`concurrency: 1` by default). camofox-browser 2.4.7 closes a user's persistent browser context when its tab count drops to zero, so a search that closes its tab while another is still navigating fails the other with `NS_BINDING_ABORTED` and then `HTTP 500`. `dsh-tool-web` runs its `queries` concurrently, so unqueued searches collide on every multi-query call.
+4. Retries a transient failure (`404`, `500`, `502`, `503`, `504`) on a fresh tab, because the tab that failed is not recoverable.
+5. Parses the accessibility tree into `WebSearchSource` entries, dropping archive mirrors (`web.archive.org`), pagination and utility links (`cached`, `translate`, `next`, `previous`), and duplicate URLs.
+6. Reports `truncated: false`; `dsh-tool-web` sets the flag when it caps the list.
+7. Fails with `WEB_ABORTED` on an aborted request and `WEB_PROVIDER_ERROR` otherwise. A search cancelled while queued reports `WEB_ABORTED` at once, without waiting for the searches ahead of it.
 
 ## Tests
 

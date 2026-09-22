@@ -17,7 +17,10 @@ import type {} from '@deepseek-ai/dsh-web'
 import {
   CAMOFOX_DEFAULT_API_KEY_ENV,
   CAMOFOX_DEFAULT_BASE_URL,
+  CAMOFOX_DEFAULT_CONCURRENCY,
   CAMOFOX_DEFAULT_ENGINE,
+  CAMOFOX_DEFAULT_RETRIES,
+  CAMOFOX_DEFAULT_RETRY_DELAY_MS,
   CAMOFOX_DEFAULT_SESSION_KEY,
   CAMOFOX_DEFAULT_USER_ID,
   CAMOFOX_ENGINES,
@@ -33,7 +36,10 @@ export type { CamofoxEngine, CamofoxMacro } from './types.ts'
 export {
   CAMOFOX_DEFAULT_API_KEY_ENV,
   CAMOFOX_DEFAULT_BASE_URL,
+  CAMOFOX_DEFAULT_CONCURRENCY,
   CAMOFOX_DEFAULT_ENGINE,
+  CAMOFOX_DEFAULT_RETRIES,
+  CAMOFOX_DEFAULT_RETRY_DELAY_MS,
   CAMOFOX_DEFAULT_SESSION_KEY,
   CAMOFOX_DEFAULT_USER_ID,
   CAMOFOX_MACROS,
@@ -69,6 +75,12 @@ export interface Config {
   searchUrl?: string
   /** Snapshot characters the parser reads. Defaults to 60000. */
   maxSnapshotChars?: number
+  /** Searches one provider instance runs at once against one camofox user. Defaults to 1. */
+  concurrency?: number
+  /** Fresh-tab attempts after a transient camofox failure. Defaults to 2. */
+  retries?: number
+  /** Milliseconds a retry waits before opening its fresh tab. Defaults to 750. */
+  retryDelayMs?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -80,6 +92,9 @@ export const Config: z<Config> = z.object({
   engine: z.union(CAMOFOX_ENGINES).default(CAMOFOX_DEFAULT_ENGINE),
   searchUrl: z.string(),
   maxSnapshotChars: z.number().step(1).min(1_000).default(CAMOFOX_MAX_SNAPSHOT_CHARS),
+  concurrency: z.number().step(1).min(1).default(CAMOFOX_DEFAULT_CONCURRENCY),
+  retries: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_RETRIES),
+  retryDelayMs: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_RETRY_DELAY_MS),
 })
 
 /**
@@ -111,6 +126,9 @@ function resolveOptions(ctx: Context, config: Config): CamofoxSearchProviderOpti
     engine: config.engine ?? CAMOFOX_DEFAULT_ENGINE,
     ...config.searchUrl !== undefined ? { searchUrl: config.searchUrl } : {},
     maxSnapshotChars: config.maxSnapshotChars ?? CAMOFOX_MAX_SNAPSHOT_CHARS,
+    concurrency: config.concurrency ?? CAMOFOX_DEFAULT_CONCURRENCY,
+    retries: config.retries ?? CAMOFOX_DEFAULT_RETRIES,
+    retryDelayMs: config.retryDelayMs ?? CAMOFOX_DEFAULT_RETRY_DELAY_MS,
   }
 }
 

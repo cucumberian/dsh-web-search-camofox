@@ -218,13 +218,119 @@ describe('CamofoxSearchProvider failures', () => {
   })
 
   it('throws WEB_PROVIDER_ERROR on a server error response', async () => {
-    const fetchMock = vi.fn(async (url: string) => {
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
       if (String(url).endsWith('/tabs')) return jsonResponse({ tabId: 'tab-1' })
       return new Response('{"error":"Internal server error"}', { status: 500 })
     })
     vi.stubGlobal('fetch', fetchMock)
-    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }))
+    await expect(new CamofoxSearchProvider(() => ({ ...options, retries: 0 })).search({ query: 'q' }))
       .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR', message: expect.stringContaining('HTTP 500') })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    const closeCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE')
+    expect(closeCall?.[0]).toBe('http://camofox.test/tabs/tab-1')
+  })
+
+  it('retries a transient server error on a fresh tab', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).endsWith('/tabs')) return jsonResponse({ tabId: `tab-${fetchMock.mock.calls.length}` })
+      if (String(url).includes('/snapshot')) return jsonResponse({ url: 'https://priv.au/search?q=q', snapshot: searxSnapshot, refsCount: 200 })
+      if (String(url).includes('/navigate')) {
+        return fetchMock.mock.calls.filter(([called]) => String(called).includes('/navigate')).length === 1
+          ? new Response('{"error":"Internal server error"}', { status: 500 })
+          : jsonResponse({ ok: true, url: 'https://priv.au/search?q=q' })
+      }
+      return jsonResponse({ ok: true })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const provider = new CamofoxSearchProvider(() => ({ ...options, retries: 2, retryDelayMs: 0 }))
+    const result = await provider.search({ query: 'q' })
+    expect(result.sources.length).toBeGreaterThan(0)
+    const tabCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/tabs'))
+    expect(tabCalls).toHaveLength(2)
+  })
+
+  it('reports the last transient failure after exhausting its attempts', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).endsWith('/tabs')) return jsonResponse({ tabId: 'tab-1' })
+      return new Response('{"error":"Internal server error"}', { status: 503 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const provider = new CamofoxSearchProvider(() => ({ ...options, retries: 1, retryDelayMs: 0 }))
+    await expect(provider.search({ query: 'q' }))
+      .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR', message: expect.stringContaining('HTTP 503') })
+    // Two attempts (one search plus one retry), each closing the tab it opened.
+    expect(fetchMock).toHaveBeenCalledTimes(6)
+  })
+
+  it('runs searches one at a time so a tab close cannot abort another navigation', async () => {
+    const active: number[] = []
+    let running = 0
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      const path = String(url)
+      if (path.endsWith('/tabs')) {
+        running += 1
+        active.push(running)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return jsonResponse({ tabId: `tab-${active.length}` })
+      }
+      if (path.includes('/navigate')) return jsonResponse({ ok: true, url: 'https://priv.au/search?q=q' })
+      if (path.includes('/snapshot')) {
+        running -= 1
+        return jsonResponse({ url: 'https://priv.au/search?q=q', snapshot: searxSnapshot, refsCount: 200 })
+      }
+      return jsonResponse({ ok: true })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const provider = new CamofoxSearchProvider(() => options)
+    const results = await Promise.all([provider.search({ query: 'a' }), provider.search({ query: 'b' })])
+    expect(results.every((result) => result.sources.length > 0)).toBe(true)
+    // Every search saw exactly one search active at its tab creation.
+    expect(active).toEqual([1, 1])
+  })
+
+  it('runs searches side by side when concurrency is raised', async () => {
+    let running = 0
+    let peak = 0
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      const path = String(url)
+      if (path.endsWith('/tabs')) {
+        running += 1
+        peak = Math.max(peak, running)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return jsonResponse({ tabId: `tab-${running}` })
+      }
+      if (path.includes('/navigate')) return jsonResponse({ ok: true, url: 'https://priv.au/search?q=q' })
+      if (path.includes('/snapshot')) {
+        running -= 1
+        return jsonResponse({ url: 'https://priv.au/search?q=q', snapshot: searxSnapshot, refsCount: 200 })
+      }
+      return jsonResponse({ ok: true })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const provider = new CamofoxSearchProvider(() => ({ ...options, concurrency: 2 }))
+    await Promise.all([provider.search({ query: 'a' }), provider.search({ query: 'b' })])
+    expect(peak).toBe(2)
+  })
+
+  it('aborts a search still waiting behind the queue', async () => {
+    const controller = new AbortController()
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      const path = String(url)
+      if (path.endsWith('/tabs')) {
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        return jsonResponse({ tabId: 'tab-1' })
+      }
+      if (path.includes('/navigate')) return jsonResponse({ ok: true, url: 'https://priv.au/search?q=q' })
+      if (path.includes('/snapshot')) return jsonResponse({ url: 'https://priv.au/search?q=q', snapshot: searxSnapshot, refsCount: 200 })
+      return jsonResponse({ ok: true })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const provider = new CamofoxSearchProvider(() => ({ ...options, retries: 0 }))
+    const first = provider.search({ query: 'a' })
+    const second = provider.search({ query: 'b' }, controller.signal)
+    controller.abort()
+    await expect(second).rejects.toMatchObject({ code: 'WEB_ABORTED' })
+    expect((await first).sources.length).toBeGreaterThan(0)
   })
 
   it('throws WEB_PROVIDER_ERROR on a network failure', async () => {

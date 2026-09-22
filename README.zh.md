@@ -23,6 +23,7 @@ pnpm add @deepseek-ai/dsh-web-search-camofox
         baseURL: "http://localhost:9377"   # camofox-browser REST API 端口
         engine: searx                      # 搜索路由（见"引擎"）
         maxSnapshotChars: 60000            # 要解析的无障碍字符数
+        concurrency: 1                     # 单实例同时执行的搜索数
         apiKeyEnv: "CAMOFOX_API_KEY"       # 密钥的凭据引用
 - id: web
   name: '@deepseek-ai/dsh-web'
@@ -40,6 +41,9 @@ pnpm add @deepseek-ai/dsh-web-search-camofox
 | `engine` | `searx` | 搜索路由，取自"引擎"表。 |
 | `searchUrl` | 未设置 | 包含 `{query}` 的结果页 URL 模板。优先于引擎自身的路由；可承载任意 SearxNG 实例。 |
 | `maxSnapshotChars` | `60000` | 解析器读取的快照字符数。超出上限的结果被丢弃。 |
+| `concurrency` | `1` | 单个提供者实例针对同一 camofox 用户同时执行的搜索数。`1` 表示排队执行。 |
+| `retries` | `2` | 瞬时失败（`404`、`500`、`502`、`503`、`504`）后在新标签页上的尝试次数。`0` 表示不重试。 |
+| `retryDelayMs` | `750` | 重试打开新标签页前的等待毫秒数。 |
 
 `dsh-tool-web` 自身的 `maxResults` 决定模型可见的来源列表长度；本提供者不做截断。
 
@@ -87,9 +91,11 @@ const results = await app.web.search({ query: 'deepseek harness' })
 
 1. 每次搜索解析密钥与当前设置区段。
 2. 打开标签页、导航到解析出的路由、读取其快照、关闭标签页。关闭失败会把标签页留在该用户的标签池中，且不会取代本次搜索的结果。
-3. 将无障碍树解析为 `WebSearchSource` 条目，丢弃归档镜像（`web.archive.org`）、分页与工具链接（`cached`、`translate`、`next`、`previous`）以及重复 URL。
-4. 上报 `truncated: false`；`dsh-tool-web` 在截断列表时设置该标记。
-5. 请求被中止时以 `WEB_ABORTED` 失败，其余情况以 `WEB_PROVIDER_ERROR` 失败。
+3. 按实例对搜索排队（默认 `concurrency: 1`）。camofox-browser 2.4.7 在某个用户的标签页数降为零时会关闭其持久浏览器上下文，因此一个搜索在另一个仍在导航时关闭自己的标签页，会让后者以 `NS_BINDING_ABORTED` 失败，随后返回 `HTTP 500`。`dsh-tool-web` 会并发执行它的 `queries`，所以未排队的搜索在每次多查询调用中都会相互冲突。
+4. 对瞬时失败（`404`、`500`、`502`、`503`、`504`）在新标签页上重试，因为失败的标签页不可恢复。
+5. 将无障碍树解析为 `WebSearchSource` 条目，丢弃归档镜像（`web.archive.org`）、分页与工具链接（`cached`、`translate`、`next`、`previous`）以及重复 URL。
+6. 上报 `truncated: false`；`dsh-tool-web` 在截断列表时设置该标记。
+7. 请求被中止时以 `WEB_ABORTED` 失败，其余情况以 `WEB_PROVIDER_ERROR` 失败。排队中被取消的搜索立即上报 `WEB_ABORTED`，无需等待排在前面的搜索完成。
 
 ## 测试
 

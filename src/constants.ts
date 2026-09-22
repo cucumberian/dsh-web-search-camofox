@@ -92,6 +92,25 @@ export const CAMOFOX_SEARX_QUERY_PARAM = 'q'
  */
 export const CAMOFOX_MAX_SNAPSHOT_CHARS = 60_000
 
+/**
+ * Searches one provider instance runs at once against one camofox user.
+ * camofox-browser 2.4.7 closes a user's persistent browser context when its tab
+ * count drops to zero, so a concurrent search's tab close aborts another
+ * search's in-flight navigation (`NS_BINDING_ABORTED`, `Target page, context or
+ * browser has been closed`). One search at a time keeps a tab open for the whole
+ * batch.
+ */
+export const CAMOFOX_DEFAULT_CONCURRENCY = 1
+
+/** Fresh-tab attempts after a transient camofox failure, beyond the first try. */
+export const CAMOFOX_DEFAULT_RETRIES = 2
+
+/** Milliseconds between attempts, long enough for camofox to relaunch its context. */
+export const CAMOFOX_DEFAULT_RETRY_DELAY_MS = 750
+
+/** Statuses a fresh tab can plausibly clear: a vanished tab or a server-side failure. */
+export const CAMOFOX_TRANSIENT_STATUSES = [404, 500, 502, 503, 504]
+
 /** Archive wrappers that replace a citeable URL with a snapshot proxy. */
 export const CAMOFOX_ARCHIVE_HOST = 'web.archive.org'
 

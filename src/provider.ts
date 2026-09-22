@@ -21,10 +21,14 @@ import type {} from '@deepseek-ai/dsh-session'
 import {
   CAMOFOX_ARCHIVE_HOST,
   CAMOFOX_CHROME_PATHS,
+  CAMOFOX_DEFAULT_CONCURRENCY,
+  CAMOFOX_DEFAULT_RETRIES,
+  CAMOFOX_DEFAULT_RETRY_DELAY_MS,
   CAMOFOX_MACROS,
   CAMOFOX_PROVIDER_ID,
   CAMOFOX_SEARX_QUERY_PARAM,
   CAMOFOX_SEARX_URLS,
+  CAMOFOX_TRANSIENT_STATUSES,
   CAMOFOX_URL_LINE_PREFIX,
 } from './constants.ts'
 import type { CamofoxEngine, CamofoxMacro, CamofoxResultDraft, CamofoxSnippetPiece } from './types.ts'
@@ -35,6 +39,16 @@ const USER_AGENT = 'deepseek-harness/0.2.0'
 
 /** Placeholder a `searchUrl` template carries the URL-encoded query in. */
 const QUERY_PLACEHOLDER = '{query}'
+
+/** HTTP-level failure whose message names the status and the server's detail. */
+class CamofoxHttpError extends WebError {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message, 'WEB_PROVIDER_ERROR')
+  }
+}
 
 /** Resolved provider options (the plugin's `apply` supplies env and constant defaults). */
 export interface CamofoxSearchProviderOptions {
@@ -50,6 +64,12 @@ export interface CamofoxSearchProviderOptions {
   searchUrl?: string
   /** Snapshot characters to parse; deeper results are dropped. */
   maxSnapshotChars: number
+  /** Searches this provider runs at once against one camofox user. 1 serializes them. */
+  concurrency?: number
+  /** Fresh-tab attempts after a transient camofox failure. 0 disables retrying. */
+  retries?: number
+  /** Milliseconds a retry waits before opening its fresh tab. */
+  retryDelayMs?: number
   /** Literal camofox API key; when present it wins over credential resolution. */
   apiKey?: string
   /** Credential reference the key is read from. */
@@ -233,6 +253,15 @@ export class CamofoxSearchProvider implements WebSearchProvider {
   readonly id = CAMOFOX_PROVIDER_ID
 
   /**
+   * Tail of the queue that serializes searches. camofox-browser 2.4.7 closes a
+   * user's persistent browser context when its tab count drops to zero, so a
+   * concurrent search's tab close aborts another search's in-flight navigation
+   * with `NS_BINDING_ABORTED`. A per-user camofox queue cannot fix that: a tab
+   * close belongs to the search that finished first.
+   */
+  private queue: Promise<unknown> = Promise.resolve()
+
+  /**
    * @param resolveOptions - options for the NEXT search, snapshotted once per
    *   search so one search never mixes two settings sections. A thunk rather
    *   than a value because the plugin's settings section can change between
@@ -251,18 +280,59 @@ export class CamofoxSearchProvider implements WebSearchProvider {
   }
 
   /**
-   * Run one search: open a tab, navigate it to the resolved route, read the
-   * rendered snapshot, and close the tab. The tab id is never reused across
-   * searches because camofox drops idle tabs from its pool, and a dropped id
-   * fails every later request with `Tab not found`.
+   * Run one search on a fresh tab, after waiting for the searches queued ahead
+   * of it. A transient failure — a tab camofox dropped, or a navigation the
+   * server lost — is retried on a new tab, because the tab that failed is not
+   * recoverable.
    * @param request - the query and optional result limit (the seam enforces the limit).
    * @param signal - cancellation forwarded to every camofox request.
    * @returns the parsed sources, with `truncated: false` because the provider
    *   applies no result-count control of its own.
    */
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
-    if (isAborted(signal)) throw new WebError('camofox search aborted', 'WEB_ABORTED')
     const options = this.resolveOptions()
+    const attempts = clampCount(options.retries, CAMOFOX_DEFAULT_RETRIES, 0) + 1
+    const concurrency = clampCount(options.concurrency, CAMOFOX_DEFAULT_CONCURRENCY)
+    const retryDelayMs = clampCount(options.retryDelayMs, CAMOFOX_DEFAULT_RETRY_DELAY_MS, 0)
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.runQueued(options, request, signal, concurrency)
+      } catch (error: unknown) {
+        if (attempt === attempts - 1 || isAborted(signal) || isAbortError(error) || !isTransient(error)) {
+          throw toWebError(error, signal)
+        }
+        await delay(retryDelayMs, signal)
+      }
+    }
+  }
+
+  /** Run one search behind the searches already queued on this instance. */
+  private async runQueued(
+    options: CamofoxSearchProviderOptions,
+    request: WebSearchRequest,
+    signal: AbortSignal | undefined,
+    concurrency: number,
+  ): Promise<WebSearchResult> {
+    const run = concurrency <= 1 ? this.queue.then(() => this.runSearch(options, request, signal)) : this.runSearch(options, request, signal)
+    // The queue tail is the run's own completion, so a cancelled search still
+    // leaves the searches behind it ordered, and the queue never blocks on a
+    // failure.
+    this.queue = run.catch(() => undefined)
+    return await raceAbort(run, signal)
+  }
+
+  /**
+   * Open a tab, navigate it to the resolved route, read the rendered snapshot,
+   * and close the tab. The tab id is never reused across searches because camofox
+   * drops idle tabs from its pool, and a dropped id fails every later request
+   * with `Tab not found`.
+   */
+  private async runSearch(
+    options: CamofoxSearchProviderOptions,
+    request: WebSearchRequest,
+    signal?: AbortSignal,
+  ): Promise<WebSearchResult> {
+    if (isAborted(signal)) throw new WebError('camofox search aborted', 'WEB_ABORTED')
     const route = resolveRoute(options, request.query)
     const apiKey = await this.resolveApiKey(options)
     let tabId: string | undefined
@@ -372,7 +442,7 @@ export class CamofoxSearchProvider implements WebSearchProvider {
       if (response.status === 401 || response.status === 403) {
         throw new WebError(`${status}; the camofox server requires a matching CAMOFOX_API_KEY`, 'WEB_PROVIDER_ERROR')
       }
-      throw new WebError(status, 'WEB_PROVIDER_ERROR')
+      throw new CamofoxHttpError(response.status, status)
     }
     try {
       return await response.json()
@@ -410,4 +480,77 @@ function isAbortError(error: unknown): boolean {
 /** Whether the caller's signal has already fired. */
 function isAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true
+}
+
+/**
+ * A failure a fresh tab can clear: an HTTP status camofox answers when a tab or
+ * its page vanished mid-search, or a request that never reached the server.
+ * @param error - the failed attempt's error.
+ * @returns whether another attempt is worth running.
+ */
+function isTransient(error: unknown): boolean {
+  return error instanceof CamofoxHttpError && CAMOFOX_TRANSIENT_STATUSES.includes(error.status)
+}
+
+/** Project any escaped value into the seam's error, with aborted reads surfaced as `WEB_ABORTED`. */
+function toWebError(error: unknown, signal?: AbortSignal): WebError {
+  if (error instanceof WebError) return error
+  if (isAborted(signal) || isAbortError(error)) return new WebError('camofox search aborted', 'WEB_ABORTED', { cause: error })
+  return new WebError(`camofox search failed: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
+}
+
+/** A configured count, or the default when the value is absent or below `minimum`. */
+function clampCount(value: number | undefined, fallback: number, minimum = 1): number {
+  return value === undefined || !Number.isFinite(value) || value < minimum ? fallback : Math.floor(value)
+}
+
+/** Wait between attempts, rejecting immediately when the caller cancels. */
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort(): void {
+      clearTimeout(timer)
+      reject(new WebError('camofox search aborted', 'WEB_ABORTED'))
+    }
+    if (signal === undefined) return
+    if (signal.aborted) {
+      clearTimeout(timer)
+      onAbort()
+      return
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Surface a queued search's outcome as soon as the caller cancels it, rather
+ * than after the searches ahead of it finish. The queued run keeps its own
+ * signal and settles on its own terms.
+ * @param run - the search's pending result.
+ * @param signal - cancellation that outranks the queue position.
+ * @returns the search result, or a `WEB_ABORTED` rejection.
+ */
+function raceAbort<T>(run: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return run
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new WebError('camofox search aborted', 'WEB_ABORTED'))
+    if (signal.aborted) {
+      onAbort()
+      return
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    run.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      },
+    )
+  })
 }
