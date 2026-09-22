@@ -1,7 +1,8 @@
 /**
- * Register a CamoFox-backed provider in `ctx.web`.
- * Uses the CamoFox server's search macros (google, youtube, amazon, reddit, etc.)
- * to perform web searches through a headless browser with anti-detection.
+ * Register a camofox-browser-backed provider in `ctx.web`. The provider drives a
+ * headless anti-detection browser tab (camofox-browser REST) to a search engine
+ * and reads the rendered accessibility snapshot back, so it reaches engines that
+ * refuse plain HTTP clients. `dsh-web` selects it through `searchProvider: camofox`.
  * @module @deepseek-ai/dsh-web-search-camofox
  */
 
@@ -9,29 +10,37 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-settings'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-web'
 import {
-  CamofoxSearchProvider,
-  CAMOFOX_PROVIDER_ID,
+  CAMOFOX_DEFAULT_API_KEY_ENV,
   CAMOFOX_DEFAULT_BASE_URL,
-  CAMOFOX_DEFAULT_USER_ID,
-  CAMOFOX_DEFAULT_SESSION_KEY,
   CAMOFOX_DEFAULT_ENGINE,
-} from './provider.ts'
-import type { CamofoxSearchProviderOptions, CamofoxEngine } from './provider.ts'
+  CAMOFOX_DEFAULT_SESSION_KEY,
+  CAMOFOX_DEFAULT_USER_ID,
+  CAMOFOX_ENGINES,
+  CAMOFOX_MAX_SNAPSHOT_CHARS,
+} from './constants.ts'
+import { CamofoxSearchProvider } from './provider.ts'
+import type { CamofoxSearchProviderOptions } from './provider.ts'
+import type { CamofoxEngine } from './types.ts'
 
+export { CamofoxSearchProvider, parseSources, resolveRoute } from './provider.ts'
+export type { CamofoxRoute, CamofoxSearchProviderOptions } from './provider.ts'
+export type { CamofoxEngine, CamofoxMacro } from './types.ts'
 export {
-  CamofoxSearchProvider,
-  CAMOFOX_PROVIDER_ID,
+  CAMOFOX_DEFAULT_API_KEY_ENV,
   CAMOFOX_DEFAULT_BASE_URL,
-  CAMOFOX_DEFAULT_USER_ID,
-  CAMOFOX_DEFAULT_SESSION_KEY,
   CAMOFOX_DEFAULT_ENGINE,
-} from './provider.ts'
-export type { CamofoxSearchProviderOptions, CamofoxEngine } from './provider.ts'
+  CAMOFOX_DEFAULT_SESSION_KEY,
+  CAMOFOX_DEFAULT_USER_ID,
+  CAMOFOX_MACROS,
+  CAMOFOX_MAX_SNAPSHOT_CHARS,
+  CAMOFOX_PROVIDER_ID,
+  CAMOFOX_SEARX_URLS,
+} from './constants.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'web-search-camofox'
@@ -39,54 +48,53 @@ export const name = 'web-search-camofox'
 /** The web seam this provider registers into. */
 export const inject = ['web']
 
-const DEFAULT_API_KEY_ENV = 'CAMOFOX_API_KEY'
+/** Settings namespace carrying this provider's endpoint, engine, and key reference. */
+export const WEB_SEARCH_CAMOFOX_SETTINGS_NAMESPACE = 'web-search-camofox'
 
-/** Plugin config (all optional — `apply` fills env-var and constant defaults). */
+/** Plugin config (all optional — `apply` fills credential, env, and constant defaults). */
 export interface Config {
-  /** Literal CamoFox API key; prefer {@link apiKeyEnv} so no secret enters configuration files. */
+  /** Literal camofox API key; prefer {@link apiKeyEnv} so no secret enters configuration files. */
   apiKey?: string
   /** Credential reference resolved for each search; defaults to `CAMOFOX_API_KEY`. */
   apiKeyEnv?: string
-  /** CamoFox server base URL. Defaults to `http://localhost:9377`. */
+  /** camofox-browser REST base URL. Defaults to `http://localhost:9377`. */
   baseURL?: string
-  /** CamoFox user ID. Defaults to `default-user`. */
+  /** camofox user identity that owns the tab and its browser profile. Defaults to `default-user`. */
   userId?: string
-  /** CamoFox session key. Defaults to `dsh-web-search`. */
+  /** camofox session key identifying this provider's tab group. Defaults to `dsh-web-search`. */
   sessionKey?: string
-  /** Search engine to use. Defaults to `google`. */
+  /** Search route. Defaults to `searx`; see the README for the engine list. */
   engine?: CamofoxEngine
+  /** Results-page URL template containing `{query}`; overrides the engine's own route. */
+  searchUrl?: string
+  /** Snapshot characters the parser reads. Defaults to 60000. */
+  maxSnapshotChars?: number
 }
 
 export const Config: z<Config> = z.object({
   apiKey: z.string().role('secret'),
-  apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV),
+  apiKeyEnv: z.string().role('credential-ref').default(CAMOFOX_DEFAULT_API_KEY_ENV),
   baseURL: z.string().default(CAMOFOX_DEFAULT_BASE_URL),
   userId: z.string().default(CAMOFOX_DEFAULT_USER_ID),
   sessionKey: z.string().default(CAMOFOX_DEFAULT_SESSION_KEY),
-  engine: z.union([
-    'google', 'youtube', 'amazon', 'reddit', 'reddit_subreddit',
-    'wikipedia', 'twitter', 'yelp', 'spotify', 'netflix',
-    'linkedin', 'instagram', 'tiktok', 'twitch'
-  ] as const).default(CAMOFOX_DEFAULT_ENGINE),
+  engine: z.union(CAMOFOX_ENGINES).default(CAMOFOX_DEFAULT_ENGINE),
+  searchUrl: z.string(),
+  maxSnapshotChars: z.number().step(1).min(1_000).default(CAMOFOX_MAX_SNAPSHOT_CHARS),
 })
-
-/** Settings namespace carrying this provider's endpoint, engine, and key reference. */
-export const WEB_SEARCH_CAMOFOX_SETTINGS_NAMESPACE = settingsNamespace('web-search-camofox')
 
 /**
  * Project one resolved section into the options the provider serves its next
- * search with. Environment fallbacks stay here rather than in the provider:
- * every value it reads is already fully defaulted.
+ * search with. Credential and environment fallbacks stay here rather than in
+ * the provider: every value it reads is already fully defaulted.
  * @param ctx - plugin context supplying the credential and environment planes.
  * @param config - the currently authoritative section.
  * @returns options for one search.
  */
 function resolveOptions(ctx: Context, config: Config): CamofoxSearchProviderOptions {
-  const apiKeyEnv = credentialRef(config.apiKeyEnv ?? DEFAULT_API_KEY_ENV)
+  const apiKeyEnv = credentialRef(config.apiKeyEnv ?? CAMOFOX_DEFAULT_API_KEY_ENV)
   const literalApiKey = config.apiKey !== undefined && config.apiKey.length > 0
     ? config.apiKey
     : undefined
-
   return {
     ...literalApiKey === undefined ? {} : { apiKey: literalApiKey },
     resolveApiKey: async () => {
@@ -101,19 +109,23 @@ function resolveOptions(ctx: Context, config: Config): CamofoxSearchProviderOpti
     userId: config.userId ?? CAMOFOX_DEFAULT_USER_ID,
     sessionKey: config.sessionKey ?? CAMOFOX_DEFAULT_SESSION_KEY,
     engine: config.engine ?? CAMOFOX_DEFAULT_ENGINE,
+    ...config.searchUrl !== undefined ? { searchUrl: config.searchUrl } : {},
+    maxSnapshotChars: config.maxSnapshotChars ?? CAMOFOX_MAX_SNAPSHOT_CHARS,
   }
 }
 
-/** Register the CamoFox search provider with `ctx.web`. */
+/** Register the camofox search provider with `ctx.web`. */
 export function apply(ctx: Context, config: Config): void {
   let current: () => Config = () => config
-  installSettingsSection(ctx, WEB_SEARCH_CAMOFOX_SETTINGS_NAMESPACE, Config, config, {
-    setSource: (source) => {
-      current = source
-    },
-    // The registration carries no resolved value: the provider projects the
-    // section per search, so a committed change needs no re-registration.
-    onChange: () => {},
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.settings.installSection(ctx, WEB_SEARCH_CAMOFOX_SETTINGS_NAMESPACE, Config, config, {
+      setSource: (source) => {
+        current = source
+      },
+      // The registration carries no resolved value: the provider projects the
+      // section per search, so a committed change needs no re-registration.
+      onChange: () => {},
+    })
   })
-  ctx.web.registerSearchProvider(new CamofoxSearchProvider(resolveOptions(ctx, current())))
+  ctx.web.registerSearchProvider(new CamofoxSearchProvider(() => resolveOptions(ctx, current())))
 }

@@ -1,0 +1,15 @@
+{
+  // Check unit for `src` and `tests`: no emission, and no extension rewrite so
+  // the specs' `./provider.ts` imports type-check as written.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rewriteRelativeImportExtensions": false,
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src", "tests"]
+}

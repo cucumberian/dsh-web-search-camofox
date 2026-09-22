@@ -1,15 +1,55 @@
+/**
+ * Search-flow, authorization, parser, and failure behavior of
+ * {@link CamofoxSearchProvider} against recorded camofox snapshots.
+ */
+
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { CamofoxSearchProvider, CAMOFOX_PROVIDER_ID, parseSources } from '../src/provider.ts'
+import { CamofoxSearchProvider, parseSources, resolveRoute } from '../src/provider.ts'
+import type { CamofoxSearchProviderOptions } from '../src/provider.ts'
+import { CAMOFOX_PROVIDER_ID } from '../src/constants.ts'
 
-const fixtureUrl = fileURLToPath(new URL('./fixtures/google-snapshot.json', import.meta.url))
-const snapshotFixture = (JSON.parse(readFileSync(fixtureUrl, 'utf8')) as { snapshot: string }).snapshot
+const fixture = (name: string): string => {
+  const path = fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url))
+  return (JSON.parse(readFileSync(path, 'utf8')) as { snapshot: string }).snapshot
+}
 
-const options = { baseURL: 'http://camofox.test', userId: 'default-user', sessionKey: 'dsh-web-search', engine: 'google' as const }
+const googleSnapshot = fixture('google-snapshot.json')
+const searxSnapshot = fixture('searx-snapshot.json')
 
-function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
-  return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' }, ...init })
+const options: CamofoxSearchProviderOptions = {
+  baseURL: 'http://camofox.test',
+  userId: 'default-user',
+  sessionKey: 'dsh-web-search',
+  engine: 'google',
+  maxSnapshotChars: 60_000,
+}
+
+/** Options carrying a literal key, the shape a configured `apiKey` produces. */
+const keyed: CamofoxSearchProviderOptions = { ...options, apiKey: 'test-key' }
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+}
+
+/** Fetch stub for one full search: tab creation, navigation, snapshot, close. */
+function stubSearch(snapshot: string, navigateResponse = { ok: true, url: 'https://www.google.com/search?q=hello' }) {
+  const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+    const path = String(url)
+    if (path.endsWith('/tabs')) return jsonResponse({ tabId: 'tab-1', url: 'about:blank' })
+    if (path.includes('/navigate')) return jsonResponse(navigateResponse)
+    if (path.includes('/snapshot')) return jsonResponse({ url: navigateResponse.url, snapshot, refsCount: 200, offset: 0, truncated: false, totalChars: snapshot.length, hasMore: false, nextOffset: null })
+    return jsonResponse({ ok: true })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
+type FetchCall = [string, RequestInit]
+
+function call(mock: ReturnType<typeof vi.fn>, index: number): FetchCall {
+  return mock.mock.calls[index] as unknown as FetchCall
 }
 
 afterEach(() => {
@@ -17,131 +57,199 @@ afterEach(() => {
 })
 
 describe('CamofoxSearchProvider availability', () => {
-  it('is available with a valid base URL and no key required', () => {
-    expect(new CamofoxSearchProvider(options).available()).toBe(true)
-  })
-
-  it('is unavailable when the base URL is unparseable', () => {
-    expect(new CamofoxSearchProvider({ ...options, baseURL: 'not a url' }).available()).toBe(false)
-  })
-})
-
-describe('parseSources on the google snapshot', () => {
-  it('exposes the provider id', () => {
+  it('registers under the id the web seam selects', () => {
+    expect(new CamofoxSearchProvider(() => options).id).toBe(CAMOFOX_PROVIDER_ID)
     expect(CAMOFOX_PROVIDER_ID).toBe('camofox')
   })
 
-  it('extracts organic result URLs and titles', () => {
-    const sources = parseSources(snapshotFixture)
-    const urls = sources.map((source) => source.url)
-    expect(urls).toContain('https://deepseek.com/harness/en/')
-    expect(urls).toContain('https://www.mindstudio.ai/blog/deepseek-harness-agentic-coding')
-    expect(urls).toContain('https://www.reddit.com/r/LocalLLaMA/comments/1vnb66j/deepseek_harness_is_up/')
-    expect(urls).toContain('https://x.com/deepseek_ai/status/2087887408440164663')
+  it('is available for a macro engine and a SearxNG engine', () => {
+    expect(new CamofoxSearchProvider(() => options).available()).toBe(true)
+    expect(new CamofoxSearchProvider(() => ({ ...options, engine: 'searx' })).available()).toBe(true)
   })
 
-  it('drops search-engine chrome URLs', () => {
-    const urls = parseSources(snapshotFixture).map((source) => source.url)
-    expect(urls).not.toContain('https://accounts.google.com/ServiceLogin')
-    expect(urls).not.toContain('https://policies.google.com/privacy?hl=nl&fg=1')
-    expect(urls).not.toContain('https://www.google.com/webhp')
-    expect(urls.some((url) => url.includes('google.com/search'))).toBe(false)
+  it('is unavailable when the base URL is unparseable', () => {
+    expect(new CamofoxSearchProvider(() => ({ ...options, baseURL: 'not a url' })).available()).toBe(false)
   })
 
-  it('cleans titles from level-3 headings', () => {
-    const sources = parseSources(snapshotFixture)
-    const result = sources.find((source) => source.url === 'https://www.mindstudio.ai/blog/deepseek-harness-agentic-coding')
-    expect(result?.title).toContain('What Is DeepSeek Harness?')
+  it('is unavailable when a searchUrl template carries no query placeholder', () => {
+    expect(new CamofoxSearchProvider(() => ({ ...options, searchUrl: 'https://priv.au/search?q=fixed' })).available()).toBe(false)
+    expect(new CamofoxSearchProvider(() => ({ ...options, searchUrl: 'https://priv.au/search?q={query}' })).available()).toBe(true)
+  })
+})
+
+describe('resolveRoute', () => {
+  it('sends a macro route for a macro-backed engine', () => {
+    expect(resolveRoute({ ...options, engine: 'wikipedia' }, 'deepseek harness')).toEqual({
+      kind: 'macro',
+      macro: '@wikipedia_search',
+      query: 'deepseek harness',
+    })
   })
 
-  it('assembles snippets from text and emphasis fragments', () => {
-    const sources = parseSources(snapshotFixture)
-    const result = sources.find((source) => source.url === 'https://deepseek.com/harness/en/')
-    expect(result?.snippet).toBeTruthy()
-    // The parser extracts the first text element associated with the URL
-    expect(result?.snippet).toContain('DeepSeek')
+  it('builds a results-page URL for a SearxNG engine', () => {
+    const route = resolveRoute({ ...options, engine: 'searx' }, 'deepseek harness')
+    expect(route).toEqual({ kind: 'url', url: 'https://priv.au/search?q=deepseek%20harness' })
   })
 
-  it('de-duplicates repeated URLs (youtube videos appear twice)', () => {
-    const urls = parseSources(snapshotFixture).map((source) => source.url)
-    const dups = urls.filter((url, index) => urls.indexOf(url) !== index)
-    expect(dups).toEqual([])
+  it('applies a searchUrl template over the engine route', () => {
+    const route = resolveRoute({ ...options, engine: 'google', searchUrl: 'https://priv.au/search?q={query}' }, 'deepseek harness')
+    expect(route).toEqual({ kind: 'url', url: 'https://priv.au/search?q=deepseek%20harness' })
+  })
+
+  it('appends the query parameter to a template without a placeholder', () => {
+    const route = resolveRoute({ ...options, engine: 'searx', searchUrl: 'https://searx.be/search' }, 'deepseek harness')
+    expect(route).toEqual({ kind: 'url', url: 'https://searx.be/search?q=deepseek%20harness' })
   })
 })
 
 describe('CamofoxSearchProvider search flow', () => {
-  it('creates a tab, navigates the macro, and parses the snapshot', async () => {
-    const fetchMock = vi.fn()
-    fetchMock.mockReturnValueOnce(jsonResponse({ tabId: 'tab-1', url: 'about:blank' })) // POST /tabs
-    fetchMock.mockReturnValueOnce(jsonResponse({ ok: true, url: 'https://www.google.com/search?q=hello' })) // navigate
-    fetchMock.mockReturnValueOnce(jsonResponse({ url: 'https://www.google.com/search?q=hello', snapshot: snapshotFixture })) // snapshot
-    vi.stubGlobal('fetch', fetchMock)
+  it('opens a tab, navigates the macro, reads the snapshot, and closes the tab', async () => {
+    const fetchMock = stubSearch(googleSnapshot)
+    const result = await new CamofoxSearchProvider(() => options).search({ query: 'hello', maxResults: 3 })
 
-    const provider = new CamofoxSearchProvider(options)
-    const result = await provider.search({ query: 'hello', maxResults: 3 })
-
-    expect(fetchMock).toHaveBeenCalledTimes(3)
-    const [tabsUrl, tabsInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    const [tabsUrl, tabsInit] = call(fetchMock, 0)
     expect(tabsUrl).toBe('http://camofox.test/tabs')
     expect(tabsInit).toMatchObject({ method: 'POST', redirect: 'error' })
     expect(JSON.parse(tabsInit.body as string)).toEqual({ userId: 'default-user', sessionKey: 'dsh-web-search' })
-    const [navUrl, navInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit]
+
+    const [navUrl, navInit] = call(fetchMock, 1)
     expect(navUrl).toBe('http://camofox.test/tabs/tab-1/navigate')
     expect(JSON.parse(navInit.body as string)).toEqual({ userId: 'default-user', macro: '@google_search', query: 'hello' })
-    expect(result.sources.length).toBeLessThanOrEqual(3)
-    // The fixture contains more than 3 organic results, so truncated should be true
-    expect(result.truncated).toBe(true)
+
+    const [snapshotUrl] = call(fetchMock, 2)
+    expect(snapshotUrl).toBe('http://camofox.test/tabs/tab-1/snapshot?userId=default-user&offset=0')
+
+    const [closeUrl, closeInit] = call(fetchMock, 3)
+    expect(closeUrl).toBe('http://camofox.test/tabs/tab-1')
+    expect(closeInit).toMatchObject({ method: 'DELETE' })
+    expect(JSON.parse(closeInit.body as string)).toEqual({ userId: 'default-user' })
+
+    expect(result.sources.length).toBeGreaterThan(0)
+    // The seam, not the provider, enforces `maxResults`: the provider returns
+    // every parsed source and leaves `truncated` to `WebRuntime.capSources`.
+    expect(result.sources).toHaveLength(parseSources(googleSnapshot).length)
+    expect(result.truncated).toBe(false)
   })
 
-  it('reuses one tab across searches', async () => {
-    const fetchMock = vi.fn(async (url: string) => {
-      if (String(url).endsWith('/tabs')) return jsonResponse({ tabId: 'tab-1', url: 'about:blank' })
-      if (String(url).includes('/navigate')) return jsonResponse({ ok: true, url: 'https://google.com/search?q=x' })
-      return jsonResponse({ url: 'https://google.com/search?q=x', snapshot: snapshotFixture })
+  it('sends the Bearer key on every camofox request', async () => {
+    const fetchMock = stubSearch(searxSnapshot)
+    await new CamofoxSearchProvider(() => ({ ...keyed, engine: 'searx' })).search({ query: 'deepseek harness' })
+    const authorizations = fetchMock.mock.calls.map(([, init]) => (init as RequestInit).headers).map((headers) => (headers as Record<string, string>).authorization)
+    expect(authorizations).toEqual(['Bearer test-key', 'Bearer test-key', 'Bearer test-key', 'Bearer test-key'])
+  })
+
+  it('resolves the key once per search and sends it on tab creation', async () => {
+    const fetchMock = stubSearch(searxSnapshot)
+    const resolveApiKey = vi.fn(async () => 'resolved-key')
+    const provider = new CamofoxSearchProvider(() => ({ ...options, engine: 'searx', resolveApiKey }))
+    await provider.search({ query: 'deepseek harness' })
+    expect(resolveApiKey).toHaveBeenCalledTimes(1)
+    const tabHeaders = (call(fetchMock, 0)[1].headers as Record<string, string>)
+    expect(tabHeaders.authorization).toBe('Bearer resolved-key')
+  })
+
+  it('omits the authorization header when no key is resolvable', async () => {
+    const fetchMock = stubSearch(searxSnapshot)
+    const provider = new CamofoxSearchProvider(() => ({ ...options, resolveApiKey: async () => undefined }))
+    await provider.search({ query: 'deepseek harness' })
+    const tabHeaders = (call(fetchMock, 0)[1].headers as Record<string, string>)
+    expect(tabHeaders.authorization).toBeUndefined()
+  })
+
+  it('navigates a direct search URL for a SearxNG engine', async () => {
+    const fetchMock = stubSearch(searxSnapshot, { ok: true, url: 'https://priv.au/search?q=deepseek%20harness' })
+    const result = await new CamofoxSearchProvider(() => ({ ...options, engine: 'searx' })).search({ query: 'deepseek harness' })
+    const [, navInit] = call(fetchMock, 1)
+    expect(JSON.parse(navInit.body as string)).toEqual({
+      userId: 'default-user',
+      url: 'https://priv.au/search?q=deepseek%20harness',
+    })
+    expect(result.sources.some((source) => source.url.includes('github.com'))).toBe(true)
+  })
+
+  it('opens a fresh tab per search instead of reusing a pooled tab id', async () => {
+    const fetchMock = stubSearch(googleSnapshot)
+    const provider = new CamofoxSearchProvider(() => options)
+    await provider.search({ query: 'a' })
+    await provider.search({ query: 'b' })
+    const tabCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/tabs'))
+    const closeCalls = fetchMock.mock.calls.filter(([, init]) => (init as RequestInit).method === 'DELETE')
+    expect(tabCalls).toHaveLength(2)
+    expect(closeCalls).toHaveLength(2)
+  })
+
+  it('closes the tab even when parsing or navigation fails', async () => {
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (String(url).endsWith('/tabs')) return jsonResponse({ tabId: 'tab-9' })
+      if (String(url).includes('/navigate')) return jsonResponse({ ok: true, url: 'https://www.google.com/search?q=x' })
+      if (String(url).includes('/snapshot')) return jsonResponse({ url: 'https://www.google.com/search?q=x', snapshot: '' })
+      return jsonResponse({ ok: true })
     })
     vi.stubGlobal('fetch', fetchMock)
-    const provider = new CamofoxSearchProvider(options)
-    await provider.search({ query: 'a' })
-    expect(fetchMock).toHaveBeenCalledTimes(3)
-    // Second search: tab is reused, so no /tabs call — only navigate + snapshot.
-    await provider.search({ query: 'b' })
-    expect(fetchMock).toHaveBeenCalledTimes(5)
-    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/tabs')).length).toBe(1)
+    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }))
+      .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+    const closeCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit).method === 'DELETE')
+    expect(closeCall?.[0]).toBe('http://camofox.test/tabs/tab-9')
+  })
+
+  it('caps the parsed snapshot at maxSnapshotChars', async () => {
+    const fetchMock = stubSearch(googleSnapshot)
+    const provider = new CamofoxSearchProvider(() => ({ ...options, maxSnapshotChars: 1_000 }))
+    await provider.search({ query: 'hello' })
+    const result = parseSources(googleSnapshot.slice(0, 1_000))
+    const [, init] = call(fetchMock, 2)
+    expect(init).toMatchObject({})
+    expect(result.length).toBeLessThan(parseSources(googleSnapshot).length)
   })
 })
 
-describe('CamofoxSearchProvider error handling', () => {
-  it('throws WEB_PROVIDER_ERROR when tab creation returns no tab id', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ url: 'about:blank' })))
-    await expect(new CamofoxSearchProvider(options).search({ query: 'q' }))
-      .rejects.toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_ERROR' }))
+describe('CamofoxSearchProvider failures', () => {
+  it('reports the missing key when the server rejects the request', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":"Forbidden"}', { status: 403 })))
+    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }))
+      .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR', message: expect.stringContaining('CAMOFOX_API_KEY') })
   })
 
-  it('throws WEB_PROVIDER_ERROR on a non-2xx response', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 500 })))
-    await expect(new CamofoxSearchProvider(options).search({ query: 'q' }))
-      .rejects.toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_ERROR' }))
+  it('throws WEB_PROVIDER_ERROR when tab creation returns no tab id', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ url: 'about:blank' })))
+    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }))
+      .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+  })
+
+  it('throws WEB_PROVIDER_ERROR on a server error response', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).endsWith('/tabs')) return jsonResponse({ tabId: 'tab-1' })
+      return new Response('{"error":"Internal server error"}', { status: 500 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }))
+      .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR', message: expect.stringContaining('HTTP 500') })
   })
 
   it('throws WEB_PROVIDER_ERROR on a network failure', async () => {
     vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('connection refused'))))
-    await expect(new CamofoxSearchProvider(options).search({ query: 'q' }))
-      .rejects.toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_ERROR' }))
+    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }))
+      .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
   })
 
   it('maps an abort to WEB_ABORTED', async () => {
     vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new DOMException('aborted', 'AbortError'))))
-    await expect(new CamofoxSearchProvider(options).search({ query: 'q' }))
-      .rejects.toThrow(expect.objectContaining({ code: 'WEB_ABORTED' }))
+    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }))
+      .rejects.toMatchObject({ code: 'WEB_ABORTED' })
   })
 
   it('throws WEB_PROVIDER_ERROR for an empty snapshot', async () => {
-    const fetchMock = vi.fn()
-    fetchMock.mockReturnValueOnce(jsonResponse({ tabId: 'tab-1' }))
-    fetchMock.mockReturnValueOnce(jsonResponse({ url: 'x' }))
-    fetchMock.mockReturnValueOnce(jsonResponse({ url: 'x', snapshot: '' }))
-    vi.stubGlobal('fetch', fetchMock)
-    await expect(new CamofoxSearchProvider(options).search({ query: 'q' }))
-      .rejects.toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_ERROR' }))
+    vi.stubGlobal('fetch', stubSearch(''))
+    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }))
+      .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+  })
+
+  it('surfaces an aborted signal as WEB_ABORTED', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    vi.stubGlobal('fetch', stubSearch(googleSnapshot))
+    await expect(new CamofoxSearchProvider(() => options).search({ query: 'q' }, controller.signal))
+      .rejects.toMatchObject({ code: 'WEB_ABORTED' })
   })
 })

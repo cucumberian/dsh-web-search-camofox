@@ -1,8 +1,8 @@
 # @deepseek-ai/dsh-web-search-camofox
 
-基于 CamoFox 的搜索提供者，用于 DeepSeek Harness 的 Web 能力缝 (`ctx.web`)。
+由 [camofox-browser](https://github.com/redf0x1/camofox-browser) 无头浏览器服务器（带反检测指纹）支撑的 DeepSeek Harness Web 能力缝 (`ctx.web`) 搜索提供者。
 
-使用 [CamoFox](https://github.com/camofox/camofox) 无头浏览器服务器（带反检测指纹）通过其搜索宏（Google、YouTube、Amazon、Reddit、Wikipedia、Twitter 等）执行网络搜索。
+camofox-browser 不提供搜索端点。每次搜索打开自己的标签页，将其导航到结果页，读取渲染后的无障碍快照，然后关闭标签页。因此引擎就是标签页导航的目标路由：一个 camofox 搜索宏，或者直接的结果页 URL。
 
 ## 安装
 
@@ -12,46 +12,55 @@ pnpm add @deepseek-ai/dsh-web-search-camofox
 
 ## 配置
 
-所有设置均为可选，可通过以下方式提供：
-
-1. **插件配置** 在 `cordis.yml` 中
-2. **设置服务**（支持热重载，按会话）
-3. **环境变量**（启动时默认值）
+每个字段都是可选的。取值优先级为：设置服务的 `web-search-camofox` 区段、本插件的 `cordis.yml` 配置、启动环境。设置区段支持热重载：提供者每次搜索都读取当前区段，因此提交的变更对下一次搜索立即生效，无需重新注册。
 
 ```yaml
-# cordis.yml
-web-search-camofox:
-  baseURL: "http://localhost:4444"    # CamoFox 服务器端点
-  engine: "google"                     # 搜索引擎（见下文）
-  maxResults: 10                       # 每次搜索的最大结果数
-  apiKeyEnv: "CAMOFOX_API_KEY"         # 凭据引用名称
+# cordis.patch.yml
+- insert:
+    - id: web-search-camofox
+      name: '@deepseek-ai/dsh-web-search-camofox'
+      config:
+        baseURL: "http://localhost:9377"   # camofox-browser REST API 端口
+        engine: searx                      # 搜索路由（见"引擎"）
+        maxSnapshotChars: 60000            # 要解析的无障碍字符数
+        apiKeyEnv: "CAMOFOX_API_KEY"       # 密钥的凭据引用
+- id: web
+  name: '@deepseek-ai/dsh-web'
+  config:
+    searchProvider: camofox                # 按 id 选择本提供者
 ```
 
-### 支持的搜索引擎
+| 字段 | 默认值 | 约定 |
+|------|--------|------|
+| `apiKey` | 未设置 | 字面密钥。优先于凭据解析；不要写入配置文件。 |
+| `apiKeyEnv` | `CAMOFOX_API_KEY` | 每次搜索解析的凭据引用。 |
+| `baseURL` | `http://localhost:9377` | camofox-browser REST 基础 URL。 |
+| `userId` | `default-user` | 拥有标签页及其持久浏览器配置文件的 camofox 身份。 |
+| `sessionKey` | `dsh-web-search` | 本提供者标签页所属的 camofox 标签组。 |
+| `engine` | `searx` | 搜索路由，取自"引擎"表。 |
+| `searchUrl` | 未设置 | 包含 `{query}` 的结果页 URL 模板。优先于引擎自身的路由；可承载任意 SearxNG 实例。 |
+| `maxSnapshotChars` | `60000` | 解析器读取的快照字符数。超出上限的结果被丢弃。 |
 
-| 引擎 | 说明 |
+`dsh-tool-web` 自身的 `maxResults` 决定模型可见的来源列表长度；本提供者不做截断。
+
+## 引擎
+
+宏引擎通过 camofox 的 `@<engine>_search` 宏导航，因此其结果页受各引擎反爬虫策略的约束。在本主机的数据中心地址上实测：Google 返回其同意墙且没有结果，Wikipedia 返回其自身的搜索框架。SearxNG 路由是直接的结果页 URL，渲染出带 `[level=3]` 标题、直接结果 URL 和 `paragraph:` 摘要的 `article` 块，这就是默认引擎为 `searx` 的原因。
+
+| 引擎 | 路由 |
 |------|------|
-| `google` | Google 网页搜索（默认） |
-| `youtube` | YouTube 视频搜索 |
-| `amazon` | Amazon 商品搜索 |
-| `reddit` | Reddit 帖子搜索 |
-| `reddit_subreddit` | 子版块特定搜索 |
-| `wikipedia` | Wikipedia 文章搜索 |
-| `twitter` | Twitter/X 搜索 |
-| `yelp` | Yelp 本地商家搜索 |
-| `spotify` | Spotify 音乐/播客搜索 |
-| `netflix` | Netflix 内容搜索 |
-| `linkedin` | LinkedIn 专业搜索 |
-| `instagram` | Instagram 内容搜索 |
-| `tiktok` | TikTok 视频搜索 |
-| `twitch` | Twitch 直播搜索 |
+| `searx` | `https://priv.au/search`（默认） |
+| `searx-ingres` | `https://search.inetol.net/search` |
+| `searx-tiekoetter` | `https://searx.tiekoetter.com/search` |
+| `google`、`youtube`、`amazon`、`reddit`、`wikipedia`、`twitter`、`yelp`、`spotify`、`netflix`、`linkedin`、`instagram`、`tiktok`、`twitch` | camofox 宏 `@<engine>_search` |
 
-### 环境变量
+完全屏蔽爬虫的引擎（Google 同意墙、Reddit 网络安全页、Mojeek 的 ALTCHA、Brave 的工作量证明、Startpage、Ecosia）不在路由之列；`searchUrl` 可承载任意其他实例或引擎。
 
-| 变量 | 用途 |
-|------|------|
-| `CAMOFOX_API_KEY` | 认证 CamoFox 服务器的 API 密钥（可选） |
-| `CAMOFOX_BASE_URL` | 覆盖默认的 `http://localhost:4444` |
+## 认证
+
+`CAMOFOX_AUTH_MODE=required` 的 camofox-browser 对每个 `POST` 请求返回 `403`，除非请求携带 `Authorization: Bearer <CAMOFOX_API_KEY>`。密钥按每次搜索解析：先经 `credentials` 缝的 `resolve(apiKeyEnv)`，再退到启动环境。`~/.dsh/.credentials.yaml` 与 `~/.dsh/.env` 都参与该解析；两个文件都必须仅对其所有者可读。401 或 403 失败时报 `camofox API error (HTTP <status>): <detail>; the camofox server requires a matching CAMOFOX_API_KEY`。
+
+`camofox-browser-mcp` 这个 MCP 服务器是同一容器的另一个消费者。除 cookie 导入工具外它不发送 `Authorization` 头，所以其创建标签页的工具在需要认证的服务器上会失败；签名办法见 profile patch 中的 `camofox-mcp-auth.mjs` 预加载。
 
 ## 使用方法
 
@@ -60,35 +69,34 @@ import { createApp } from '@deepseek-ai/cordis'
 import webSearchCamofox from '@deepseek-ai/dsh-web-search-camofox'
 
 const app = createApp()
-app.plugin(webSearchCamofox, {
-  baseURL: 'http://localhost:4444',
-  engine: 'google',
-  maxResults: 10,
-})
+app.plugin(webSearchCamofox, { baseURL: 'http://localhost:9377', engine: 'searx' })
+app.plugin(web, { searchProvider: 'camofox' })
 
-// 提供者现已通过 ctx.web 可用
 const results = await app.web.search({ query: 'deepseek harness' })
 ```
 
-## 要求
-
-- **CamoFox 服务器**在配置的 `baseURL` 运行
-- 服务器必须启用搜索宏
-- 可选：如果服务器启用了认证，需要 `CAMOFOX_API_KEY`
-
 ## 架构
 
-本包遵循 [Web 能力缝](/docs/glossary.md#capability-seam)：
+本包遵循 [Web 能力缝](https://github.com/deepseek-ai/dsh/blob/master/docs/glossary.md#capability-seam)：
 
-- **服务定义**: `@deepseek-ai/dsh-web`（提供 `ctx.web`）
-- **服务提供者**: 本包（注册 `CamoFoxSearchProvider`）
-- **消费者**: 任何调用 `ctx.web.search()` 的代码
+- **服务定义**：`@deepseek-ai/dsh-web`（提供 `ctx.web`）
+- **服务提供者**：本包（以 id `camofox` 注册提供者）
+- **消费者**：任何调用 `ctx.web.search()` 的代码，包括 `dsh-tool-web`
 
 提供者：
-1. 按搜索解析凭据（支持热重载设置）
-2. 分发到 CamoFox `/search` 端点
-3. 将无障碍快照解析为 `WebSearchResult`
-4. 将无密钥的请求元数据记录到会话日志 (`web/camofox-search-request`)
+
+1. 每次搜索解析密钥与当前设置区段。
+2. 打开标签页、导航到解析出的路由、读取其快照、关闭标签页。关闭失败会把标签页留在该用户的标签池中，且不会取代本次搜索的结果。
+3. 将无障碍树解析为 `WebSearchSource` 条目，丢弃归档镜像（`web.archive.org`）、分页与工具链接（`cached`、`translate`、`next`、`previous`）以及重复 URL。
+4. 上报 `truncated: false`；`dsh-tool-web` 在截断列表时设置该标记。
+5. 请求被中止时以 `WEB_ABORTED` 失败，其余情况以 `WEB_PROVIDER_ERROR` 失败。
+
+## 测试
+
+```bash
+pnpm run test        # 针对 src 的单元测试，使用 tests/fixtures 中记录的快照
+pnpm run test:e2e    # 真实容器；没有 $CAMOFOX_API_KEY 时自行跳过
+```
 
 ## 许可证
 
