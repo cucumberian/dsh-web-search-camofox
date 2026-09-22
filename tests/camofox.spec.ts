@@ -312,6 +312,25 @@ describe('CamofoxSearchProvider failures', () => {
     expect(peak).toBe(2)
   })
 
+  it('waits for camofox to close a context before the next queued search opens a tab', async () => {
+    const stamps: { method: 'open' | 'close'; at: number }[] = []
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const path = String(url)
+      const method = (init as RequestInit | undefined)?.method
+      if (method === 'DELETE') stamps.push({ method: 'close', at: Date.now() })
+      else if (path.endsWith('/tabs')) stamps.push({ method: 'open', at: Date.now() })
+      if (path.endsWith('/tabs')) return jsonResponse({ tabId: 'tab-1' })
+      if (path.includes('/navigate')) return jsonResponse({ ok: true, url: 'https://priv.au/search?q=q' })
+      if (path.includes('/snapshot')) return jsonResponse({ url: 'https://priv.au/search?q=q', snapshot: searxSnapshot, refsCount: 200 })
+      return jsonResponse({ ok: true })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const provider = new CamofoxSearchProvider(() => ({ ...options, engine: 'searx', closeSettleMs: 150 }))
+    await Promise.all([provider.search({ query: 'a' }), provider.search({ query: 'b' })])
+    expect(stamps.map((stamp) => stamp.method)).toEqual(['open', 'close', 'open', 'close'])
+    expect(stamps[2]!.at - stamps[1]!.at).toBeGreaterThanOrEqual(140)
+  })
+
   it('aborts a search still waiting behind the queue', async () => {
     const controller = new AbortController()
     const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {

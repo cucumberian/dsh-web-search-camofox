@@ -21,6 +21,7 @@ import type {} from '@deepseek-ai/dsh-session'
 import {
   CAMOFOX_ARCHIVE_HOST,
   CAMOFOX_CHROME_PATHS,
+  CAMOFOX_DEFAULT_CLOSE_SETTLE_MS,
   CAMOFOX_DEFAULT_CONCURRENCY,
   CAMOFOX_DEFAULT_RETRIES,
   CAMOFOX_DEFAULT_RETRY_DELAY_MS,
@@ -70,6 +71,8 @@ export interface CamofoxSearchProviderOptions {
   retries?: number
   /** Milliseconds a retry waits before opening its fresh tab. */
   retryDelayMs?: number
+  /** Milliseconds the queue waits after a tab close before opening the next search's tab. */
+  closeSettleMs?: number
   /** Literal camofox API key; when present it wins over credential resolution. */
   apiKey?: string
   /** Credential reference the key is read from. */
@@ -294,9 +297,10 @@ export class CamofoxSearchProvider implements WebSearchProvider {
     const attempts = clampCount(options.retries, CAMOFOX_DEFAULT_RETRIES, 0) + 1
     const concurrency = clampCount(options.concurrency, CAMOFOX_DEFAULT_CONCURRENCY)
     const retryDelayMs = clampCount(options.retryDelayMs, CAMOFOX_DEFAULT_RETRY_DELAY_MS, 0)
+    const settleDelayMs = clampCount(options.closeSettleMs, CAMOFOX_DEFAULT_CLOSE_SETTLE_MS, 0)
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.runQueued(options, request, signal, concurrency)
+        return await this.runQueued(options, request, signal, concurrency, settleDelayMs)
       } catch (error: unknown) {
         if (attempt === attempts - 1 || isAborted(signal) || isAbortError(error) || !isTransient(error)) {
           throw toWebError(error, signal)
@@ -312,12 +316,16 @@ export class CamofoxSearchProvider implements WebSearchProvider {
     request: WebSearchRequest,
     signal: AbortSignal | undefined,
     concurrency: number,
+    settleDelayMs: number,
   ): Promise<WebSearchResult> {
-    const run = concurrency <= 1 ? this.queue.then(() => this.runSearch(options, request, signal)) : this.runSearch(options, request, signal)
-    // The queue tail is the run's own completion, so a cancelled search still
-    // leaves the searches behind it ordered, and the queue never blocks on a
-    // failure.
-    this.queue = run.catch(() => undefined)
+    if (concurrency > 1) return await raceAbort(this.runSearch(options, request, signal), signal)
+    const run = this.queue.then(() => this.runSearch(options, request, signal))
+    // The queue tail is the run's completion plus camofox's own tab-close settle:
+    // a search that opens its tab while the previous user context is still
+    // shutting down gets `HTTP 500` from the server. The settle gates the next
+    // search, so it is not cancelled with this search's signal. A failed run
+    // leaves the searches behind it ordered and never blocks the queue.
+    this.queue = run.then(() => delay(settleDelayMs)).catch(() => undefined)
     return await raceAbort(run, signal)
   }
 

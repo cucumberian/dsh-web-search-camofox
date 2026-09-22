@@ -44,6 +44,7 @@ pnpm add @deepseek-ai/dsh-web-search-camofox
 | `concurrency` | `1` | 单个提供者实例针对同一 camofox 用户同时执行的搜索数。`1` 表示排队执行。 |
 | `retries` | `2` | 瞬时失败（`404`、`500`、`502`、`503`、`504`）后在新标签页上的尝试次数。`0` 表示不重试。 |
 | `retryDelayMs` | `750` | 重试打开新标签页前的等待毫秒数。 |
+| `closeSettleMs` | `300` | 队列在标签页关闭后、下一次排队搜索打开标签页前的等待毫秒数。camofox 在用户最后一个标签页关闭后异步关闭其持久上下文，在这个时间窗口内发出的 `POST /tabs` 会返回 `HTTP 500`。在 2.4.7 上实测：150 ms 仍然失败，300 ms 正常。 |
 
 `dsh-tool-web` 自身的 `maxResults` 决定模型可见的来源列表长度；本提供者不做截断。
 
@@ -91,7 +92,7 @@ const results = await app.web.search({ query: 'deepseek harness' })
 
 1. 每次搜索解析密钥与当前设置区段。
 2. 打开标签页、导航到解析出的路由、读取其快照、关闭标签页。关闭失败会把标签页留在该用户的标签池中，且不会取代本次搜索的结果。
-3. 按实例对搜索排队（默认 `concurrency: 1`）。camofox-browser 2.4.7 在某个用户的标签页数降为零时会关闭其持久浏览器上下文，因此一个搜索在另一个仍在导航时关闭自己的标签页，会让后者以 `NS_BINDING_ABORTED` 失败，随后返回 `HTTP 500`。`dsh-tool-web` 会并发执行它的 `queries`，所以未排队的搜索在每次多查询调用中都会相互冲突。
+3. 按实例对搜索排队（默认 `concurrency: 1`，间隔 `closeSettleMs`）。camofox-browser 2.4.7 在某个用户的标签页数降为零时会关闭其持久浏览器上下文：一个搜索在另一个仍在导航时关闭自己的标签页，会让后者以 `NS_BINDING_ABORTED` 失败；在异步关闭窗口内打开的新标签页会以 `HTTP 500`（`can't access property "delayedStartupPromise", window is null`）失败。`dsh-tool-web` 会并发执行它的 `queries`，所以未排队的搜索在每次多查询调用中都会相互冲突。
 4. 对瞬时失败（`404`、`500`、`502`、`503`、`504`）在新标签页上重试，因为失败的标签页不可恢复。
 5. 将无障碍树解析为 `WebSearchSource` 条目，丢弃归档镜像（`web.archive.org`）、分页与工具链接（`cached`、`translate`、`next`、`previous`）以及重复 URL。
 6. 上报 `truncated: false`；`dsh-tool-web` 在截断列表时设置该标记。

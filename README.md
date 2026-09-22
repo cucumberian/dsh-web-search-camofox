@@ -44,9 +44,7 @@ Every field is optional. Values come from, in precedence order, the Settings ser
 | `concurrency` | `1` | Searches one provider instance runs at once against one camofox user. `1` queues them. |
 | `retries` | `2` | Fresh-tab attempts after a transient failure (`404`, `500`, `502`, `503`, `504`). `0` disables retrying. |
 | `retryDelayMs` | `750` | Wait before a retry opens its fresh tab. |
-| `concurrency` | `1` | Searches one provider instance runs at once against one camofox user. `1` queues them. |
-| `retries` | `2` | Fresh-tab attempts after a transient failure (`404`, `500`, `502`, `503`, `504`). `0` disables retrying. |
-| `retryDelayMs` | `750` | Wait before a retry opens its fresh tab. |
+| `closeSettleMs` | `300` | Wait the queue holds after a tab close before the next queued search opens its tab. camofox closes a user's persistent context asynchronously after its last tab closes, and a `POST /tabs` sent inside that window answers `HTTP 500`. Measured on 2.4.7: 150 ms still fails, 300 ms is clean. |
 
 `dsh-tool-web`'s own `maxResults` caps the source list the model sees; this provider does not truncate.
 
@@ -94,7 +92,7 @@ The provider:
 
 1. Resolves the key and the current settings section per search.
 2. Opens a tab, navigates it to the resolved route, reads its snapshot, closes it. A failed close leaves the tab in the user's pool and does not replace the search's outcome.
-3. Queues searches per instance (`concurrency: 1` by default). camofox-browser 2.4.7 closes a user's persistent browser context when its tab count drops to zero, so a search that closes its tab while another is still navigating fails the other with `NS_BINDING_ABORTED` and then `HTTP 500`. `dsh-tool-web` runs its `queries` concurrently, so unqueued searches collide on every multi-query call.
+3. Queues searches per instance (`concurrency: 1` by default, `closeSettleMs` apart). camofox-browser 2.4.7 closes a user's persistent browser context when its tab count drops to zero: a search that closes its tab while another is still navigating fails the other with `NS_BINDING_ABORTED`, and a tab opened inside the asynchronous close window fails with `HTTP 500` (`can't access property "delayedStartupPromise", window is null`). `dsh-tool-web` runs its `queries` concurrently, so unqueued searches collide on every multi-query call.
 4. Retries a transient failure (`404`, `500`, `502`, `503`, `504`) on a fresh tab, because the tab that failed is not recoverable.
 5. Parses the accessibility tree into `WebSearchSource` entries, dropping archive mirrors (`web.archive.org`), pagination and utility links (`cached`, `translate`, `next`, `previous`), and duplicate URLs.
 6. Reports `truncated: false`; `dsh-tool-web` sets the flag when it caps the list.

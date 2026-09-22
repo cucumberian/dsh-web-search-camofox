@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-web'
 import {
   CAMOFOX_DEFAULT_API_KEY_ENV,
   CAMOFOX_DEFAULT_BASE_URL,
+  CAMOFOX_DEFAULT_CLOSE_SETTLE_MS,
   CAMOFOX_DEFAULT_CONCURRENCY,
   CAMOFOX_DEFAULT_ENGINE,
   CAMOFOX_DEFAULT_RETRIES,
@@ -36,6 +37,7 @@ export type { CamofoxEngine, CamofoxMacro } from './types.ts'
 export {
   CAMOFOX_DEFAULT_API_KEY_ENV,
   CAMOFOX_DEFAULT_BASE_URL,
+  CAMOFOX_DEFAULT_CLOSE_SETTLE_MS,
   CAMOFOX_DEFAULT_CONCURRENCY,
   CAMOFOX_DEFAULT_ENGINE,
   CAMOFOX_DEFAULT_RETRIES,
@@ -81,6 +83,8 @@ export interface Config {
   retries?: number
   /** Milliseconds a retry waits before opening its fresh tab. Defaults to 750. */
   retryDelayMs?: number
+  /** Milliseconds the queue waits after a tab close before the next queued search opens a tab. Defaults to 300. */
+  closeSettleMs?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -95,6 +99,7 @@ export const Config: z<Config> = z.object({
   concurrency: z.number().step(1).min(1).default(CAMOFOX_DEFAULT_CONCURRENCY),
   retries: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_RETRIES),
   retryDelayMs: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_RETRY_DELAY_MS),
+  closeSettleMs: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_CLOSE_SETTLE_MS),
 })
 
 /**
@@ -129,6 +134,7 @@ function resolveOptions(ctx: Context, config: Config): CamofoxSearchProviderOpti
     concurrency: config.concurrency ?? CAMOFOX_DEFAULT_CONCURRENCY,
     retries: config.retries ?? CAMOFOX_DEFAULT_RETRIES,
     retryDelayMs: config.retryDelayMs ?? CAMOFOX_DEFAULT_RETRY_DELAY_MS,
+    closeSettleMs: config.closeSettleMs ?? CAMOFOX_DEFAULT_CLOSE_SETTLE_MS,
   }
 }
 

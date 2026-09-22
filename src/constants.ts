@@ -108,6 +108,16 @@ export const CAMOFOX_DEFAULT_RETRIES = 2
 /** Milliseconds between attempts, long enough for camofox to relaunch its context. */
 export const CAMOFOX_DEFAULT_RETRY_DELAY_MS = 750
 
+/**
+ * Milliseconds the queue waits after a search's tab close before the next
+ * queued search opens a tab. camofox-browser closes a user's persistent context
+ * asynchronously after its last tab closes: a `POST /tabs` sent within ~150 ms of
+ * a `DELETE /tabs` answers `HTTP 500` with
+ * `can't access property "delayedStartupPromise", window is null`. Measured on
+ * 2.4.7, 150 ms still fails and 300 ms is clean.
+ */
+export const CAMOFOX_DEFAULT_CLOSE_SETTLE_MS = 300
+
 /** Statuses a fresh tab can plausibly clear: a vanished tab or a server-side failure. */
 export const CAMOFOX_TRANSIENT_STATUSES = [404, 500, 502, 503, 504]
 
