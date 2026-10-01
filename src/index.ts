@@ -6,7 +6,7 @@
  * @module @deepseek-ai/dsh-web-search-camofox
  */
 
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
@@ -31,7 +31,7 @@ import { CamofoxSearchProvider } from './provider.ts'
 import type { CamofoxSearchProviderOptions } from './provider.ts'
 import type { CamofoxEngine } from './types.ts'
 
-export { CamofoxSearchProvider, parseSources, resolveRoute } from './provider.ts'
+export { CamofoxSearchProvider, parseSources, resolveResultUrl, resolveRoute } from './provider.ts'
 export type { CamofoxRoute, CamofoxSearchProviderOptions } from './provider.ts'
 export type { CamofoxEngine, CamofoxMacro } from './types.ts'
 export {
@@ -47,6 +47,7 @@ export {
   CAMOFOX_MACROS,
   CAMOFOX_MAX_SNAPSHOT_CHARS,
   CAMOFOX_PROVIDER_ID,
+  CAMOFOX_RESULT_URLS,
   CAMOFOX_SEARX_URLS,
 } from './constants.ts'
 
@@ -59,47 +60,54 @@ export const inject = ['web']
 /** Settings namespace carrying this provider's endpoint, engine, and key reference. */
 export const WEB_SEARCH_CAMOFOX_SETTINGS_NAMESPACE = 'web-search-camofox'
 
-/** Plugin config (all optional — `apply` fills credential, env, and constant defaults). */
+/**
+ * Plugin config (every field optional — `apply` fills credential, env, and
+ * constant defaults). Every field is `volatile`, which is what makes the whole
+ * section editable from the settings page: the settings plane rejects a write to
+ * a path the schema did not mark volatile, and a volatile field reaches the
+ * plugin as an accessor whose `get()` reads the value the next search sees. A
+ * committed change therefore needs no restart and no re-registration.
+ */
 export interface Config {
   /** Literal camofox API key; prefer {@link apiKeyEnv} so no secret enters configuration files. */
-  apiKey?: string
+  apiKey: Volatile<string | undefined>
   /** Credential reference resolved for each search; defaults to `CAMOFOX_API_KEY`. */
-  apiKeyEnv?: string
+  apiKeyEnv: Volatile<string>
   /** camofox-browser REST base URL. Defaults to `http://localhost:9377`. */
-  baseURL?: string
+  baseURL: Volatile<string>
   /** camofox user identity that owns the tab and its browser profile. Defaults to `default-user`. */
-  userId?: string
+  userId: Volatile<string>
   /** camofox session key identifying this provider's tab group. Defaults to `dsh-web-search`. */
-  sessionKey?: string
+  sessionKey: Volatile<string>
   /** Search route. Defaults to `searx`; see the README for the engine list. */
-  engine?: CamofoxEngine
+  engine: Volatile<CamofoxEngine>
   /** Results-page URL template containing `{query}`; overrides the engine's own route. */
-  searchUrl?: string
+  searchUrl: Volatile<string | undefined>
   /** Snapshot characters the parser reads. Defaults to 60000. */
-  maxSnapshotChars?: number
+  maxSnapshotChars: Volatile<number>
   /** Searches one provider instance runs at once against one camofox user. Defaults to 1. */
-  concurrency?: number
+  concurrency: Volatile<number>
   /** Fresh-tab attempts after a transient camofox failure. Defaults to 2. */
-  retries?: number
+  retries: Volatile<number>
   /** Milliseconds a retry waits before opening its fresh tab. Defaults to 750. */
-  retryDelayMs?: number
+  retryDelayMs: Volatile<number>
   /** Milliseconds the queue waits after a tab close before the next queued search opens a tab. Defaults to 300. */
-  closeSettleMs?: number
+  closeSettleMs: Volatile<number>
 }
 
-export const Config: z<Config> = z.object({
-  apiKey: z.string().role('secret'),
-  apiKeyEnv: z.string().role('credential-ref').default(CAMOFOX_DEFAULT_API_KEY_ENV),
-  baseURL: z.string().default(CAMOFOX_DEFAULT_BASE_URL),
-  userId: z.string().default(CAMOFOX_DEFAULT_USER_ID),
-  sessionKey: z.string().default(CAMOFOX_DEFAULT_SESSION_KEY),
-  engine: z.union(CAMOFOX_ENGINES).default(CAMOFOX_DEFAULT_ENGINE),
-  searchUrl: z.string(),
-  maxSnapshotChars: z.number().step(1).min(1_000).default(CAMOFOX_MAX_SNAPSHOT_CHARS),
-  concurrency: z.number().step(1).min(1).default(CAMOFOX_DEFAULT_CONCURRENCY),
-  retries: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_RETRIES),
-  retryDelayMs: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_RETRY_DELAY_MS),
-  closeSettleMs: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_CLOSE_SETTLE_MS),
+export const Config = z.object({
+  apiKey: z.string().role('secret').volatile(),
+  apiKeyEnv: z.string().role('credential-ref').default(CAMOFOX_DEFAULT_API_KEY_ENV).volatile(),
+  baseURL: z.string().default(CAMOFOX_DEFAULT_BASE_URL).volatile(),
+  userId: z.string().default(CAMOFOX_DEFAULT_USER_ID).volatile(),
+  sessionKey: z.string().default(CAMOFOX_DEFAULT_SESSION_KEY).volatile(),
+  engine: z.union(CAMOFOX_ENGINES).default(CAMOFOX_DEFAULT_ENGINE).volatile(),
+  searchUrl: z.string().volatile(),
+  maxSnapshotChars: z.number().step(1).min(1_000).default(CAMOFOX_MAX_SNAPSHOT_CHARS).volatile(),
+  concurrency: z.number().step(1).min(1).default(CAMOFOX_DEFAULT_CONCURRENCY).volatile(),
+  retries: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_RETRIES).volatile(),
+  retryDelayMs: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_RETRY_DELAY_MS).volatile(),
+  closeSettleMs: z.number().step(1).min(0).default(CAMOFOX_DEFAULT_CLOSE_SETTLE_MS).volatile(),
 })
 
 /**
@@ -111,10 +119,14 @@ export const Config: z<Config> = z.object({
  * @returns options for one search.
  */
 function resolveOptions(ctx: Context, config: Config): CamofoxSearchProviderOptions {
-  const apiKeyEnv = credentialRef(config.apiKeyEnv ?? CAMOFOX_DEFAULT_API_KEY_ENV)
-  const literalApiKey = config.apiKey !== undefined && config.apiKey.length > 0
-    ? config.apiKey
+  // Every field is a volatile accessor, so reading here always sees the value the
+  // next search must use; the fallbacks cover a section the plane never filled.
+  const apiKeyEnv = credentialRef(config.apiKeyEnv.get() ?? CAMOFOX_DEFAULT_API_KEY_ENV)
+  const literalApiKeyValue = config.apiKey.get()
+  const literalApiKey = literalApiKeyValue !== undefined && literalApiKeyValue.length > 0
+    ? literalApiKeyValue
     : undefined
+  const searchUrl = config.searchUrl.get()
   return {
     ...literalApiKey === undefined ? {} : { apiKey: literalApiKey },
     resolveApiKey: async () => {
@@ -125,31 +137,28 @@ function resolveOptions(ctx: Context, config: Config): CamofoxSearchProviderOpti
       return ambient !== undefined && ambient.value.length > 0 ? ambient.value : undefined
     },
     apiKeyEnv,
-    baseURL: config.baseURL ?? CAMOFOX_DEFAULT_BASE_URL,
-    userId: config.userId ?? CAMOFOX_DEFAULT_USER_ID,
-    sessionKey: config.sessionKey ?? CAMOFOX_DEFAULT_SESSION_KEY,
-    engine: config.engine ?? CAMOFOX_DEFAULT_ENGINE,
-    ...config.searchUrl !== undefined ? { searchUrl: config.searchUrl } : {},
-    maxSnapshotChars: config.maxSnapshotChars ?? CAMOFOX_MAX_SNAPSHOT_CHARS,
-    concurrency: config.concurrency ?? CAMOFOX_DEFAULT_CONCURRENCY,
-    retries: config.retries ?? CAMOFOX_DEFAULT_RETRIES,
-    retryDelayMs: config.retryDelayMs ?? CAMOFOX_DEFAULT_RETRY_DELAY_MS,
-    closeSettleMs: config.closeSettleMs ?? CAMOFOX_DEFAULT_CLOSE_SETTLE_MS,
+    baseURL: config.baseURL.get() ?? CAMOFOX_DEFAULT_BASE_URL,
+    userId: config.userId.get() ?? CAMOFOX_DEFAULT_USER_ID,
+    sessionKey: config.sessionKey.get() ?? CAMOFOX_DEFAULT_SESSION_KEY,
+    engine: config.engine.get() ?? CAMOFOX_DEFAULT_ENGINE,
+    ...searchUrl !== undefined ? { searchUrl } : {},
+    maxSnapshotChars: config.maxSnapshotChars.get() ?? CAMOFOX_MAX_SNAPSHOT_CHARS,
+    concurrency: config.concurrency.get() ?? CAMOFOX_DEFAULT_CONCURRENCY,
+    retries: config.retries.get() ?? CAMOFOX_DEFAULT_RETRIES,
+    retryDelayMs: config.retryDelayMs.get() ?? CAMOFOX_DEFAULT_RETRY_DELAY_MS,
+    closeSettleMs: config.closeSettleMs.get() ?? CAMOFOX_DEFAULT_CLOSE_SETTLE_MS,
   }
 }
 
-/** Register the camofox search provider with `ctx.web`. */
+/**
+ * Register the camofox search provider with `ctx.web`.
+ *
+ * The config needs no settings registration of its own: every field is volatile,
+ * so the section the plugin was handed stays authoritative and each search
+ * projects it fresh. A committed change reaches the next search without a
+ * restart, and the provider is registered exactly once, which keeps the seam's
+ * selection unobservable as a flicker.
+ */
 export function apply(ctx: Context, config: Config): void {
-  let current: () => Config = () => config
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, WEB_SEARCH_CAMOFOX_SETTINGS_NAMESPACE, Config, config, {
-      setSource: (source) => {
-        current = source
-      },
-      // The registration carries no resolved value: the provider projects the
-      // section per search, so a committed change needs no re-registration.
-      onChange: () => {},
-    })
-  })
-  ctx.web.registerSearchProvider(new CamofoxSearchProvider(() => resolveOptions(ctx, current())))
+  ctx.web.registerSearchProvider(new CamofoxSearchProvider(() => resolveOptions(ctx, config)))
 }

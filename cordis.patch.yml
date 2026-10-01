@@ -1,0 +1,17 @@
+# Camofox-backed web search for this dsh profile.
+#
+# Row 1 mounts the provider plugin; `dsh-web` then selects it by id (`camofox`)
+# because the profile also ships the built-in DeepSeek search provider, and the
+# seam only auto-selects when exactly one usable provider is registered.
+# Every provider field below is optional and hot-reloadable at runtime through
+# the Settings section `web-search-camofox`; this file only carries the defaults.
+- insert:
+    - id: web-search-camofox
+      name: '@deepseek-ai/dsh-web-search-camofox'
+      config:
+        baseURL: 'http://localhost:9377'
+        engine: searx
+- id: web
+  name: '@deepseek-ai/dsh-web'
+  config:
+    searchProvider: camofox

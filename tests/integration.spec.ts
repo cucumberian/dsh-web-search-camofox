@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import type { Fiber } from '@deepseek-ai/cordis'
+import type { Fiber, Volatile } from '@deepseek-ai/cordis'
 import LocalCredentialProvider from '@deepseek-ai/dsh-credentials-local'
 import { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
@@ -70,13 +70,24 @@ function stubCamofox(snapshot = SNIPPET): Array<[string, RequestInit]> {
   return calls
 }
 
+/**
+ * The plain values a test writes for this plugin. Every `Config` field is
+ * volatile, so the plugin reads each one through an accessor; the composition
+ * builds those accessors from exactly these values, which is what mounting a
+ * real entry with a YAML section does too.
+ */
+type ConfigInput = { [K in keyof WebSearchCamofox.Config]?: WebSearchCamofox.Config[K] extends Volatile<infer V> ? V : never }
+
 /** Mount the seam configured for camofox, the settings service, and this plugin. */
-async function boot(config: WebSearchCamofox.Config = {}): Promise<{ ctx: Context; settingsFiber: Fiber; pluginFiber: Fiber }> {
+async function boot(config: ConfigInput = {}): Promise<{ ctx: Context; settingsFiber: Fiber; pluginFiber: Fiber }> {
   const ctx = new Context()
   const webFiber = await ctx.plugin(WebRuntime, { searchProvider: CAMOFOX_PROVIDER_ID })
   const settingsFiber = ctx.plugin(MemorySettings)
   await settingsFiber.await()
-  const pluginFiber = ctx.plugin(WebSearchCamofox, config)
+  // `Config`'s fields are volatile accessors, while a composition entry — and
+  // this bench — hands the plugin the plain values those accessors read. The
+  // cast says so; `ConfigInput` keeps the call sites typed.
+  const pluginFiber = ctx.plugin(WebSearchCamofox, config as never)
   await pluginFiber.await()
   void webFiber
   return { ctx, settingsFiber, pluginFiber }
