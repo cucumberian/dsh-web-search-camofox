@@ -10,11 +10,15 @@ camofox-browser exposes no search endpoint. Each search opens its own tab, navig
 pnpm add @deepseek-ai/dsh-web-search-camofox
 ```
 
+The package is not on the public registry yet — that command answers `404` today. Install it from a
+checkout instead (the harness plugin manager takes a directory path or a git spec), and the registry
+line starts working when it is published.
+
 ## Configuration
 
 Every field is optional. Values come from, in precedence order, the Settings service section `web-search-camofox`, this plugin's `cordis.yml` config, and the launch environment. The Settings section is hot-reloaded: the provider reads the current section per search, so a committed change applies to the next search without re-registration.
 
-Every field is declared `volatile`, which is what makes the section editable at all: the settings plane rejects a write to a path the schema did not mark volatile, and a volatile field reaches the plugin as an accessor whose `get()` always reads the current value. A field the schema left plain is therefore unreadable *and* unwritable from the settings surface — the plugin still sees the composition value, but no form can offer it.
+Every field is declared `volatile`, which is what makes the section editable at all: the settings plane rejects a write to a path the schema did not mark volatile, and a volatile field reaches the plugin as an accessor whose `get()` always reads the current value. A field the schema left plain is therefore not writable through the settings plane at all — the plugin still sees the composition value, and a form can at best show that field read-only.
 
 ```yaml
 # cordis.patch.yml
@@ -41,7 +45,7 @@ Every field is declared `volatile`, which is what makes the section editable at 
 | `userId` | `default-user` | camofox identity that owns the tab and its persistent browser profile. |
 | `sessionKey` | `dsh-web-search` | camofox tab group this provider's tabs belong to. |
 | `engine` | `searx` | Search route, from the Engines table. |
-| `searchUrl` | unset | Results-page URL template containing `{query}`. Overrides the engine's own route; carries any SearxNG instance. |
+| `searchUrl` | unset | Results-page URL template containing `{query}`. Overrides the engine's own route; carries any other SearxNG instance or results page. |
 | `maxSnapshotChars` | `60000` | Snapshot characters the parser reads. Results past the bound are dropped. |
 | `concurrency` | `1` | Searches one provider instance runs at once against one camofox user. `1` queues them. |
 | `retries` | `2` | Fresh-tab attempts after a transient failure (`404`, `500`, `502`, `503`, `504`). `0` disables retrying. |
@@ -89,28 +93,38 @@ are dropped as chrome. Macro engines navigate through camofox, so their pages ar
 engine's bot defense: measured on this host's datacenter address, Google answers its consent wall and
 returns no results, and Wikipedia returns its own search chrome.
 
-Engines that block bots outright (Google's consent wall, Reddit's network security page, Mojeek's
-ALTCHA, Brave's proof of work, Startpage, Ecosia) are not routes here; `searchUrl` carries any other
-instance or engine, `{query}` marking where the encoded query lands.
+Engines that answer nothing but a wall (Reddit's network security page, Mojeek's ALTCHA, Brave's proof
+of work, Startpage, Ecosia) are not routes here; `searchUrl` carries any other instance or engine,
+`{query}` marking where the encoded query lands. `google` and `wikipedia` stay listed because camofox
+carries their macros, but measured here they return the wall or their own chrome rather than results, so
+neither is a useful default.
 
 ## Authentication
 
 camofox-browser with `CAMOFOX_AUTH_MODE=required` answers `403` to every `POST` unless the request carries `Authorization: Bearer <CAMOFOX_API_KEY>`. The key is resolved per search: the `credentials` seam's `resolve(apiKeyEnv)` first, then the launch environment. `~/.dsh/.credentials.yaml` and `~/.dsh/.env` both feed that resolution; both files must be readable only by their owner. A 401 or 403 fails with `camofox API error (HTTP <status>): <detail>; the camofox server requires a matching CAMOFOX_API_KEY`.
 
-The `camofox-browser-mcp` MCP server is a separate consumer of the same container. It sends no `Authorization` header outside its cookie-import tool, so its tab-creating tools fail against an auth-required server; see `camofox-mcp-auth.mjs` in the profile patch for the preload that signs them.
+The `camofox-browser-mcp` MCP server is a separate consumer of the same container. It sends no
+`Authorization` header outside its cookie-import tool, so its tab-creating tools fail against an
+auth-required server; leaving that server open on loopback (`CAMOFOX_AUTH_MODE` unset) is what lets both
+consumers share it.
 
 ## Usage
 
 ```typescript
-import { createApp } from '@deepseek-ai/cordis'
-import webSearchCamofox from '@deepseek-ai/dsh-web-search-camofox'
+import { Context } from '@deepseek-ai/cordis'
+import WebRuntime from '@deepseek-ai/dsh-web'
+import * as webSearchCamofox from '@deepseek-ai/dsh-web-search-camofox'
 
-const app = createApp()
-app.plugin(webSearchCamofox, { baseURL: 'http://localhost:9377', engine: 'searx' })
-app.plugin(web, { searchProvider: 'camofox' })
+const ctx = new Context()
+await ctx.plugin(webSearchCamofox, { baseURL: 'http://localhost:9377', engine: 'searx' })
+await ctx.plugin(WebRuntime, { searchProvider: 'camofox' })
 
-const results = await app.web.search({ query: 'deepseek harness' })
+const results = await ctx.web.search({ query: 'deepseek harness' })
 ```
+
+This package exports `apply`, `inject`, `name`, and `Config` and has no default export, hence
+the namespace import; `@deepseek-ai/dsh-web` provides its plugin as the default export. A composition
+entry carries plain values, which the plugin reads through each field's volatile accessor.
 
 ## Architecture
 
@@ -126,7 +140,7 @@ The provider:
 2. Opens a tab, navigates it to the resolved route, reads its snapshot, closes it. A failed close leaves the tab in the user's pool and does not replace the search's outcome.
 3. Queues searches per instance (`concurrency: 1` by default, `closeSettleMs` apart). camofox-browser 2.4.7 closes a user's persistent browser context when its tab count drops to zero: a search that closes its tab while another is still navigating fails the other with `NS_BINDING_ABORTED`, and a tab opened inside the asynchronous close window fails with `HTTP 500` (`can't access property "delayedStartupPromise", window is null`). `dsh-tool-web` runs its `queries` concurrently, so unqueued searches collide on every multi-query call.
 4. Retries a transient failure (`404`, `500`, `502`, `503`, `504`) on a fresh tab, because the tab that failed is not recoverable.
-5. Parses the accessibility tree into `WebSearchSource` entries, dropping archive mirrors (`web.archive.org`), pagination and utility links (`cached`, `translate`, `next`, `previous`), and duplicate URLs.
+5. Parses the accessibility tree into `WebSearchSource` entries: unwraps redirect annotations into the address behind them (`resolveResultUrl`), drops archive mirrors (`web.archive.org`), pagination and utility links (`cached`, `translate`, `next`, `previous`), and the search site's own chrome (DuckDuckGo's hosts, Yandex's hosts, a Bing related-search link), then merges the blocks that cite one address into one source.
 6. Reports `truncated: false`; `dsh-tool-web` sets the flag when it caps the list.
 7. Fails with `WEB_ABORTED` on an aborted request and `WEB_PROVIDER_ERROR` otherwise. A search cancelled while queued reports `WEB_ABORTED` at once, without waiting for the searches ahead of it.
 
