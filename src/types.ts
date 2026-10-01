@@ -34,15 +34,18 @@ export interface CamofoxSnapshotResponse {
 }
 
 /**
- * Search route keys. The macro-backed keys map to a server macro
- * (`CAMOFOX_MACROS`); the `searx*` keys build a direct results-page URL from a
- * public SearxNG instance, and `searchUrl` overrides the instance for any other
- * engine that renders the same result blocks.
+ * Search route keys, in the three families the settings page groups. The `searx*`
+ * keys build a results-page URL from a public SearxNG instance; the macro-backed
+ * keys map to a server macro (`CAMOFOX_MACROS`); `duckduckgo` and `yandex` are
+ * direct result pages reached through their own results URL
+ * (`CAMOFOX_RESULT_URLS`), which is also what `searchUrl` overrides.
  */
 export type CamofoxEngine =
   | 'searx'
   | 'searx-ingres'
   | 'searx-tiekoetter'
+  | 'duckduckgo'
+  | 'yandex'
   | 'google'
   | 'youtube'
   | 'amazon'

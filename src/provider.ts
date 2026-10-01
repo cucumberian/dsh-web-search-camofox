@@ -27,6 +27,7 @@ import {
   CAMOFOX_DEFAULT_RETRY_DELAY_MS,
   CAMOFOX_MACROS,
   CAMOFOX_PROVIDER_ID,
+  CAMOFOX_RESULT_URLS,
   CAMOFOX_SEARX_QUERY_PARAM,
   CAMOFOX_SEARX_URLS,
   CAMOFOX_TRANSIENT_STATUSES,
@@ -96,7 +97,9 @@ export type CamofoxRoute =
 export function resolveRoute(options: CamofoxSearchProviderOptions, query: string): CamofoxRoute {
   const macro = CAMOFOX_MACROS[options.engine as keyof typeof CAMOFOX_MACROS] as CamofoxMacro | undefined
   if (options.searchUrl === undefined && macro !== undefined) return { kind: 'macro', macro, query }
-  const base = options.searchUrl ?? CAMOFOX_SEARX_URLS[options.engine as keyof typeof CAMOFOX_SEARX_URLS]
+  const base = options.searchUrl
+    ?? CAMOFOX_SEARX_URLS[options.engine as keyof typeof CAMOFOX_SEARX_URLS]
+    ?? CAMOFOX_RESULT_URLS[options.engine as keyof typeof CAMOFOX_RESULT_URLS]
   if (base === undefined) return { kind: 'macro', macro: CAMOFOX_MACROS.google, query }
   if (base.includes(QUERY_PLACEHOLDER)) {
     return { kind: 'url', url: base.replace(QUERY_PLACEHOLDER, encodeURIComponent(query)) }
@@ -129,6 +132,13 @@ function isCiteableUrl(url: string): boolean {
     if (host === CAMOFOX_ARCHIVE_HOST && path.startsWith('/web/')) return false
     if (CAMOFOX_CHROME_PATHS.includes(path)) return false
     if (host === 'accounts.google.com' || host === 'policies.google.com' || host === 'support.google.com') return false
+    // Every DuckDuckGo result arrives as a `/l/` redirect that `resolveResultUrl`
+    // has already unwrapped, so any remaining engine-host link is its own chrome;
+    // Yandex links its tab bar, login, and footer directly, and offers a
+    // related-search link to Bing.
+    if (host === 'duckduckgo.com') return false
+    if (/(^|\.)yandex\.(com|ru)$/.test(host)) return false
+    if ((host === 'bing.com' || host.endsWith('.bing.com')) && path === '/search') return false
     if (host.endsWith('.google.com')) {
       const chrome = ['/search', '/url', '/webhp', '/preferences', '/setprefs', '/sethomepage', '/intl/', '/advanced_search', '/xjs/', '/']
       if (chrome.some((prefix) => path.startsWith(prefix))) return false
@@ -139,12 +149,59 @@ function isCiteableUrl(url: string): boolean {
   }
 }
 
+/**
+ * Turn one `/url:` annotation into the address a source should cite. Some result
+ * pages annotate links with protocol-relative redirect targets — DuckDuckGo
+ * writes `//duckduckgo.com/l/?uddg=<target>`, Yandex writes
+ * `/clck/jsredir?url=<target>` — so the annotation is neither the citation nor an
+ * absolute URL until it is resolved and unwrapped.
+ * @param url - the raw `/url:` annotation.
+ * @returns the absolute target URL, or the annotation when it is not a redirect.
+ */
+export function resolveResultUrl(url: string): string {
+  const candidate = url.startsWith('//') ? `https:${url}` : url
+  try {
+    const parsed = new URL(candidate)
+    const host = parsed.hostname.toLowerCase()
+    const duckRedirect = host === 'duckduckgo.com' && (parsed.pathname === '/l' || parsed.pathname === '/l/')
+    const yandexRedirect = /(^|\.)yandex\.(com|ru)$/.test(host) && parsed.pathname.startsWith('/clck')
+    if (!duckRedirect && !yandexRedirect) return candidate
+    const target = parsed.searchParams.get(duckRedirect ? 'uddg' : 'url')
+    return typeof target === 'string' && /^https?:\/\//i.test(target) ? target : candidate
+  } catch {
+    return candidate
+  }
+}
+
+/**
+ * True when a label restates the address instead of naming the page. SearxNG,
+ * DuckDuckGo and Yandex all annotate a result as its own link text —
+ * `felloai.com/deepseek-v4/`, or a bare `felloai.com` — which is an address, not
+ * a title, and must never win a title against a real heading.
+ */
+function isUrlLikeLabel(label: string | undefined): boolean {
+  if (label === undefined) return false
+  const value = label.trim()
+  return value.length === 0 || /^https?:\/\//i.test(value)
+    || /^(https?:\/\/)?[\w-]+(\.[\w-]+)+(:\d+)?(\/\S*)?$/.test(value)
+    || value.includes(' \u203a ')
+}
+
+/**
+ * True when a label or heading is page machinery rather than the name of a
+ * result: a counter ("5 sources"), pagination ("Page 4"), an expander.
+ */
+function isUtilityLabel(label: string): boolean {
+  const value = label.trim()
+  return /^\d+\s+\S+$/.test(value) || /^(show more|see more|more|next|previous|page \d+|\d+)$/i.test(value)
+}
+
 /** Match a `link "label" [eN]:` line, quoted or bare, labeled or unlabeled. */
 function matchLink(content: string): { label?: string } | undefined {
   const labeled = content.match(/^'?link\s+"((?:[^"\\]|\\.)*)"(?:\s*\[e\d+\])?'?:?\s*$/)?.[1]
   if (labeled !== undefined) {
     const label = labeled.replace(/\\"/g, '"').split(/ https?:\/\//)[0]?.trim() ?? ''
-    return label.length > 0 ? { label } : {}
+    return label.length > 0 && !isUtilityLabel(label) ? { label } : {}
   }
   if (/^link\s*(?:\[[^\]]*\])?:?$/.test(content)) return {}
   return undefined
@@ -177,9 +234,15 @@ function matchSnippetPiece(content: string): CamofoxSnippetPiece | undefined {
   return value.length > 0 ? { kind: match[1] as CamofoxSnippetPiece['kind'], value } : undefined
 }
 
-/** True for a breadcrumb or URL echo line, which is engine chrome rather than result text. */
+/**
+ * True for engine chrome rather than result text: a breadcrumb or URL echo, a
+ * separator run (`—`, `|`, `"|"`), or the tail of a sentence the page split
+ * around a date (`". V4-Pro-0813 was released."`).
+ */
 function isChromePiece(piece: CamofoxSnippetPiece): boolean {
   return /^https?:\/\//i.test(piece.value) || piece.value.includes(' \u203a ')
+    || /^[\s.\-\u2014\u2013:;,\u00b7|"']+$/.test(piece.value)
+    || /^[.\u2014\u2013:;,"']\s/.test(piece.value)
 }
 
 /**
@@ -206,13 +269,25 @@ export function parseSources(snapshot: string): WebSearchSource[] {
     if (content.length === 0) continue
     const link = matchLink(content)
     if (link !== undefined) {
-      const url = blockUrl(lines, i)
+      const annotated = blockUrl(lines, i)
+      const url = annotated === undefined ? undefined : resolveResultUrl(annotated)
       if (url === undefined || !isCiteableUrl(url)) {
         current = undefined
         continue
       }
       if (current?.url === url) {
-        if (current.label === undefined && link.label !== undefined) current.label = link.label
+        // The same address is usually annotated several times: once as the title,
+        // once as the bare address, and on DuckDuckGo once more as the
+        // description. A long label is that description; a short one wins the
+        // title only when it beats what the block already offers.
+        const label = link.label
+        if (label !== undefined && !isChromePiece({ kind: 'text', value: label }) && !isUrlLikeLabel(label)) {
+          if (label.length >= 60 && label.includes(' ')) {
+            if (!current.pieces.some((piece) => piece.value === label)) current.pieces.push({ kind: 'paragraph', value: label })
+          } else if ((current.label ?? '').length < label.length) {
+            current.label = label
+          }
+        }
         continue
       }
       current = { url, indent, pieces: [] }
@@ -222,26 +297,55 @@ export function parseSources(snapshot: string): WebSearchSource[] {
     }
     const heading = matchHeading(content, 3)
     if (heading !== undefined) {
-      const url = blockUrl(lines, i)
-      if (current !== undefined && (url === undefined || url === current.url)) current.title ??= heading
+      const annotated = blockUrl(lines, i)
+      const url = annotated === undefined ? undefined : resolveResultUrl(annotated)
+      if (current !== undefined && (url === undefined || url === current.url) && !isUtilityLabel(heading)) current.title ??= heading
       continue
     }
-    if (matchHeading(content, 2) !== undefined) {
-      current = undefined
+    const section = matchHeading(content, 2)
+    if (section !== undefined) {
+      // SearxNG opens a page section with a level-2 heading, but Yandex and
+      // DuckDuckGo nest the result title inside the result link, so a heading
+      // deeper than the open block titles it instead of ending it.
+      if (current !== undefined && indent > current.indent && current.title === undefined && !isUtilityLabel(section)) {
+        current.title = section
+      } else {
+        current = undefined
+      }
       continue
     }
     const piece = matchSnippetPiece(content)
     if (piece !== undefined && current !== undefined && indent >= current.indent) current.pieces.push(piece)
   }
+  // One address is usually cited by several blocks — a fact card naming only the
+  // site, then the organic result naming the page — so the blocks are merged
+  // before a title and a snippet are chosen from them.
+  const merged: CamofoxResultDraft[] = []
+  const byUrl = new Map<string, CamofoxResultDraft>()
+  for (const draft of drafts) {
+    const existing = byUrl.get(draft.url)
+    if (existing === undefined) {
+      byUrl.set(draft.url, draft)
+      merged.push(draft)
+      continue
+    }
+    if (existing.title === undefined && draft.title !== undefined) existing.title = draft.title
+    const candidate = draft.label
+    if (candidate !== undefined && !isUrlLikeLabel(candidate)) {
+      const known = existing.label
+      if (known === undefined || isUrlLikeLabel(known) || candidate.length > known.length) existing.label = candidate
+    }
+    existing.pieces.push(...draft.pieces)
+  }
   const sources: WebSearchSource[] = []
   const seen = new Set<string>()
-  for (const draft of drafts) {
+  for (const draft of merged) {
     if (seen.has(draft.url)) continue
     seen.add(draft.url)
     const paragraphs = draft.pieces.filter((piece) => piece.kind === 'paragraph').map((piece) => piece.value)
     const pieces = paragraphs.length > 0 ? paragraphs : draft.pieces.filter((piece) => !isChromePiece(piece)).map((piece) => piece.value)
     const snippet = pieces.join(' ').replace(/\s+/g, ' ').trim()
-    const label = draft.label !== undefined && !/^https?:\/\//i.test(draft.label) && !draft.label.includes('\u203a') ? draft.label : undefined
+    const label = isUrlLikeLabel(draft.label) ? undefined : draft.label
     const title = draft.title ?? label
     const source: { url: string; title?: string; snippet?: string } = { url: draft.url }
     if (title !== undefined && title.length > 0) source.title = title
@@ -278,7 +382,9 @@ export class CamofoxSearchProvider implements WebSearchProvider {
     if (!URL.canParse(options.baseURL)) return false
     if (options.userId.length === 0 || options.sessionKey.length === 0) return false
     if (options.searchUrl !== undefined) return options.searchUrl.includes(QUERY_PLACEHOLDER)
-    const route = CAMOFOX_MACROS[options.engine as keyof typeof CAMOFOX_MACROS] ?? CAMOFOX_SEARX_URLS[options.engine as keyof typeof CAMOFOX_SEARX_URLS]
+    const route = CAMOFOX_MACROS[options.engine as keyof typeof CAMOFOX_MACROS]
+      ?? CAMOFOX_SEARX_URLS[options.engine as keyof typeof CAMOFOX_SEARX_URLS]
+      ?? CAMOFOX_RESULT_URLS[options.engine as keyof typeof CAMOFOX_RESULT_URLS]
     return route !== undefined
   }
 

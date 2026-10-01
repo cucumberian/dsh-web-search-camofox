@@ -14,6 +14,8 @@ pnpm add @deepseek-ai/dsh-web-search-camofox
 
 每个字段都是可选的。取值优先级为：设置服务的 `web-search-camofox` 区段、本插件的 `cordis.yml` 配置、启动环境。设置区段支持热重载：提供者每次搜索都读取当前区段，因此提交的变更对下一次搜索立即生效，无需重新注册。
 
+每个字段都声明为 `volatile`，这正是它可被编辑的前提：设置平面会拒绝对 schema 未标记为 volatile 的路径写入，而 volatile 字段以访问器形式到达插件，其 `get()` 永远读取当前值。schema 中未标记的字段在设置界面上既读不到也写不进——插件仍能看到组合配置里的值，但任何表单都不会提供它。
+
 ```yaml
 # cordis.patch.yml
 - insert:
@@ -48,16 +50,35 @@ pnpm add @deepseek-ai/dsh-web-search-camofox
 
 `dsh-tool-web` 自身的 `maxResults` 决定模型可见的来源列表长度；本提供者不做截断。
 
+### 设置页面
+
+`client.js` 是本包的浏览器侧（`package.json` → `dsh.client`）。它通过 `plugins.row.config` 插槽把该行的
+配置贡献给插件页面，键为 `@deepseek-ai/dsh-web-search-camofox#web-search-camofox`，因此
+**插件 → dsh-web-search-camofox** 会为上述每个字段给出表单：引擎下拉按三个路由家族分组，每个字段在提交时
+（失焦或回车）写入，清空字段即重新继承默认值。该插槽的两个特性决定了代码的写法：
+
+- 插件页面在挂载时才**声明** `plugins.row.config`，所以本条目实体化时插槽常常还不存在，直接
+  `ctx.slots.register` 会抛出 `slot "plugins.row.config" is not declared`；因此条目会重试——注入会等待稍后的
+  声明，插槽订阅会对页面挂载作出反应，慢速定时器则覆盖那些声明通知到不了动态组合条目的宿主；
+- 取值经由 `ctx.configForms` 到达，于是表单跟随设置平面：命名空间不再被服务时退化为一行，并报告刚提交的写入。
+
 ## 引擎
 
-宏引擎通过 camofox 的 `@<engine>_search` 宏导航，因此其结果页受各引擎反爬虫策略的约束。在本主机的数据中心地址上实测：Google 返回其同意墙且没有结果，Wikipedia 返回其自身的搜索框架。SearxNG 路由是直接的结果页 URL，渲染出带 `[level=3]` 标题、直接结果 URL 和 `paragraph:` 摘要的 `article` 块，这就是默认引擎为 `searx` 的原因。
+可用的路由分三个家族，每个家族渲染出的可达性树都不一样，这正是解析器需要消化的部分：
 
-| 引擎 | 路由 |
-|------|------|
-| `searx` | `https://priv.au/search`（默认） |
-| `searx-ingres` | `https://search.inetol.net/search` |
-| `searx-tiekoetter` | `https://searx.tiekoetter.com/search` |
-| `google`、`youtube`、`amazon`、`reddit`、`wikipedia`、`twitter`、`yelp`、`spotify`、`netflix`、`linkedin`、`instagram`、`tiktok`、`twitch` | camofox 宏 `@<engine>_search` |
+| 家族 | 引擎 | 路由 |
+|------|------|------|
+| SearxNG 实例 | `searx`（默认）、`searx-ingres`、`searx-tiekoetter` | 公共实例的 `/search`，查询放在 `q` |
+| 直接结果页 | `duckduckgo`、`yandex` | 站点自身的结果页，`{query}` 用它自己的参数名 |
+| camofox 宏 | `google`、`youtube`、`amazon`、`reddit`、`wikipedia`、`twitter`、`yelp`、`spotify`、`netflix`、`linkedin`、`instagram`、`tiktok`、`twitch` | camofox `@<engine>_search` |
+
+SearxNG 渲染出带 `[level=3]` 标题、直接结果 URL 和 `paragraph:` 摘要的 `article` 块，这就是默认引擎为
+`searx` 的原因。直接结果页需要解析器做更多工作：DuckDuckGo 在 `html` 端点应答，并把每条结果标注为
+协议相对的 `//duckduckgo.com/l/?uddg=<target>` 重定向，由 `resolveResultUrl` 解析并展开，描述则作为同一地址上的
+第四个链接给出；Yandex 把结果标题嵌在结果链接内部的 `[level=2]` 标题里，同一个地址会被引用两次（先是在
+时间线卡片里只写站点名，然后是在自然结果里写页面名），并且直接链接自己的标签栏、登录与页脚，因此这些
+域名被当作页面框架丢弃。宏引擎经 camofox 导航，其页面受各引擎反爬虫策略约束：在本主机的数据中心地址上
+实测，Google 返回其同意墙且没有结果，Wikipedia 返回其自身的搜索框架。
 
 完全屏蔽爬虫的引擎（Google 同意墙、Reddit 网络安全页、Mojeek 的 ALTCHA、Brave 的工作量证明、Startpage、Ecosia）不在路由之列；`searchUrl` 可承载任意其他实例或引擎。
 
@@ -101,8 +122,9 @@ const results = await app.web.search({ query: 'deepseek harness' })
 ## 测试
 
 ```bash
-pnpm run test        # 针对 src 的单元测试，使用 tests/fixtures 中记录的快照
-pnpm run test:e2e    # 真实容器；没有 $CAMOFOX_API_KEY 时自行跳过
+pnpm run test          # 针对 src 的单元测试，使用 tests/fixtures 中记录的快照
+pnpm run test:client   # 用 fake 的插槽/语言/设置服务运行 client.js，并用 React 真实渲染
+pnpm run test:e2e      # 真实容器；没有 $CAMOFOX_API_KEY 时自行跳过
 ```
 
 ## 许可证

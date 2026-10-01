@@ -14,6 +14,8 @@ pnpm add @deepseek-ai/dsh-web-search-camofox
 
 Every field is optional. Values come from, in precedence order, the Settings service section `web-search-camofox`, this plugin's `cordis.yml` config, and the launch environment. The Settings section is hot-reloaded: the provider reads the current section per search, so a committed change applies to the next search without re-registration.
 
+Every field is declared `volatile`, which is what makes the section editable at all: the settings plane rejects a write to a path the schema did not mark volatile, and a volatile field reaches the plugin as an accessor whose `get()` always reads the current value. A field the schema left plain is therefore unreadable *and* unwritable from the settings surface — the plugin still sees the composition value, but no form can offer it.
+
 ```yaml
 # cordis.patch.yml
 - insert:
@@ -48,18 +50,48 @@ Every field is optional. Values come from, in precedence order, the Settings ser
 
 `dsh-tool-web`'s own `maxResults` caps the source list the model sees; this provider does not truncate.
 
+### Settings page
+
+`client.js` is this package's browser half (`package.json` → `dsh.client`). It contributes the row's
+configuration to the Plugins page through the `plugins.row.config` slot, keyed
+`@deepseek-ai/dsh-web-search-camofox#web-search-camofox`, so **Plugins → dsh-web-search-camofox** offers
+a form over every field above: the engine select groups the three route families, each field writes on
+commit (blur or Enter), and clearing a field re-inherits its default. Two properties of that slot shape
+the code:
+
+- the Plugins page **declares** `plugins.row.config` when it mounts, so the slot is usually absent while
+  this entry materializes and a plain `ctx.slots.register` throws `slot "plugins.row.config" is not
+  declared`; the entry therefore retries — the injection waits for a later declaration, a slot
+  subscription reacts to the page mounting, and a slow timer covers hosts whose declaration
+  notification never reaches a dynamically composed entry;
+- the values arrive over `ctx.configForms`, so the form follows the settings plane: it degrades to one
+  line when the namespace stops being served and reports the write it just committed.
+
 ## Engines
 
-Macro engines navigate through camofox's `@<engine>_search` macros, so their result pages are subject to each engine's bot defense. Measured on this host's datacenter address, Google answers its consent wall and returns no results, and Wikipedia returns its own search chrome. The SearxNG routes are direct results-page URLs that render `article` blocks with `[level=3]` headings, direct result URLs, and `paragraph:` snippets, which is why `searx` is the default.
+Three families of route are available, and each renders the accessibility tree differently, which is
+what the parser has to absorb:
 
-| Engine | Route |
-|--------|-------|
-| `searx` | `https://priv.au/search` (default) |
-| `searx-ingres` | `https://search.inetol.net/search` |
-| `searx-tiekoetter` | `https://searx.tiekoetter.com/search` |
-| `google`, `youtube`, `amazon`, `reddit`, `wikipedia`, `twitter`, `yelp`, `spotify`, `netflix`, `linkedin`, `instagram`, `tiktok`, `twitch` | camofox macro `@<engine>_search` |
+| Family | Engines | Route |
+|--------|---------|-------|
+| SearxNG instances | `searx` (default), `searx-ingres`, `searx-tiekoetter` | a public instance's `/search`, query in `q` |
+| Direct result pages | `duckduckgo`, `yandex` | the site's own results page, `{query}` in its own parameter |
+| camofox macros | `google`, `youtube`, `amazon`, `reddit`, `wikipedia`, `twitter`, `yelp`, `spotify`, `netflix`, `linkedin`, `instagram`, `tiktok`, `twitch` | camofox `@<engine>_search` |
 
-Engines that block bots outright (Google's consent wall, Reddit's network security page, Mojeek's ALTCHA, Brave's proof of work, Startpage, Ecosia) are not routes here; `searchUrl` carries any other instance or engine.
+SearxNG renders `article` blocks with `[level=3]` headings, direct result URLs, and `paragraph:`
+snippets, which is why `searx` is the default. The direct pages need more of the parser: DuckDuckGo
+answers at its `html` endpoint and annotates every result as a protocol-relative
+`//duckduckgo.com/l/?uddg=<target>` redirect, which `resolveResultUrl` resolves and unwraps, and carries
+the description as a fourth link over the same address; Yandex nests the result title in a `[level=2]`
+heading inside the result link, cites one address twice (a fact card naming only the site, then the
+organic result naming the page), and links its own tab bar, login, and footer directly, so those hosts
+are dropped as chrome. Macro engines navigate through camofox, so their pages are subject to each
+engine's bot defense: measured on this host's datacenter address, Google answers its consent wall and
+returns no results, and Wikipedia returns its own search chrome.
+
+Engines that block bots outright (Google's consent wall, Reddit's network security page, Mojeek's
+ALTCHA, Brave's proof of work, Startpage, Ecosia) are not routes here; `searchUrl` carries any other
+instance or engine, `{query}` marking where the encoded query lands.
 
 ## Authentication
 
@@ -101,9 +133,14 @@ The provider:
 ## Tests
 
 ```bash
-pnpm run test        # unit tests against src, recorded snapshots in tests/fixtures
-pnpm run test:e2e    # live container; self-skips without $CAMOFOX_API_KEY
+pnpm run test          # unit tests against src, recorded snapshots in tests/fixtures
+pnpm run test:client   # client.js against fake slot/locale/settings services, rendered with React
+pnpm run test:e2e      # live container; self-skips without $CAMOFOX_API_KEY
 ```
+
+`tests/fixtures` records one real accessibility snapshot per engine family. Recapture one after changing
+a route with the container API — `POST /tabs`, `POST /tabs/{id}/navigate`, then
+`GET /tabs/{id}/snapshot?userId=default-user&offset=0` — and store it as `{ "url", "snapshot" }`.
 
 ## License
 

@@ -58,11 +58,25 @@ export const CAMOFOX_SEARX_URLS = {
   'searx-tiekoetter': 'https://searx.tiekoetter.com/search',
 } as const
 
-/** Engine keys accepted by `Config.engine`: every macro key plus every SearxNG key. */
+/**
+ * Results-page URL per direct result page, `{query}` marking where the encoded
+ * query lands. DuckDuckGo is reached through its `html` endpoint because that
+ * variant annotates each result with the target behind a redirect, which
+ * `resolveResultUrl` unwraps, while the main page wraps every link in one.
+ * Yandex needs the placeholder too: it reads the query from `text`, not `q`.
+ */
+export const CAMOFOX_RESULT_URLS = {
+  duckduckgo: 'https://html.duckduckgo.com/html/?q={query}',
+  yandex: 'https://yandex.com/search/?text={query}',
+} as const
+
+/** Engine keys accepted by `Config.engine`: every SearxNG, direct, and macro key. */
 export const CAMOFOX_ENGINES = [
   'searx',
   'searx-ingres',
   'searx-tiekoetter',
+  'duckduckgo',
+  'yandex',
   'google',
   'youtube',
   'amazon',
